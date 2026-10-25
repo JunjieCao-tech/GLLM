@@ -1,0 +1,95 @@
+# ============================================================
+# LLM obsolescence study: reproducible figure script
+# Inputs: main_article.txt and main_model.txt in the package root
+# Outputs: analysis data, statistical results, 600 dpi PNG and vector PDF
+# ============================================================
+required_packages <- c("ggplot2","dplyr","tidyr","forcats","scales","sandwich","lmtest")
+missing_packages <- required_packages[!vapply(required_packages,requireNamespace,logical(1),quietly=TRUE)]
+if(length(missing_packages)>0) install.packages(missing_packages,repos="https://cloud.r-project.org",dependencies=TRUE)
+suppressPackageStartupMessages({library(ggplot2);library(dplyr);library(tidyr);library(forcats);library(scales)})
+get_script_dir <- function(){
+  override<-Sys.getenv("LLM_LAG_SCRIPT_DIR",unset="")
+  if(nzchar(override))return(normalizePath(override,mustWork=TRUE))
+  args<-commandArgs(trailingOnly=FALSE); f<-grep("^--file=",args,value=TRUE)
+  if(length(f)>0)return(dirname(normalizePath(sub("^--file=","",f[1]))))
+  if(requireNamespace("rstudioapi",quietly=TRUE)&&rstudioapi::isAvailable()){
+    p<-rstudioapi::getActiveDocumentContext()$path;if(nzchar(p))return(dirname(normalizePath(p)))
+  }
+  normalizePath(getwd())
+}
+script_dir<-get_script_dir(); project_dir<-normalizePath(file.path(script_dir,".."),mustWork=FALSE)
+read_tsv_safe<-function(path){
+  if(!file.exists(path))stop("Missing input: ",path)
+  for(enc in c("UTF-8","UTF-8-BOM","GB18030","GBK")){
+    lines<-tryCatch(readLines(path,encoding=enc,warn=FALSE),error=function(e)NULL)
+    if(is.null(lines)||length(lines)<2)next
+    x<-tryCatch(read.delim(textConnection(lines),sep="\t",header=TRUE,quote="\"",fill=TRUE,comment.char="",stringsAsFactors=FALSE,check.names=FALSE,na.strings=c("","NA","N/A")),error=function(e)NULL)
+    if(!is.null(x)&&nrow(x)>1)return(x)
+  }
+  stop("Cannot read: ",path)
+}
+article_dat<-read_tsv_safe(file.path(project_dir,"main_article.txt"))|>mutate(
+  article_no=as.numeric(article_no),publication_year=as.numeric(publication_year),model_count=as.numeric(model_count),mapped_model_count=as.numeric(mapped_model_count),mapping_coverage=as.numeric(mapping_coverage),
+  across(c(lag_submission_mean_days,lag_acceptance_mean_days,lag_online_mean_days,review_delay_days,production_delay_days,total_editorial_delay_days),as.numeric),
+  submission_date=as.Date(submission_date),acceptance_date=as.Date(acceptance_date),online_date=as.Date(online_date),
+  any_nonpositive_submission=tolower(as.character(any_nonpositive_submission))%in%c("true","1"),has_lamda=tolower(as.character(has_lamda))%in%c("true","1"))
+model_dat<-read_tsv_safe(file.path(project_dir,"main_model.txt"))|>mutate(
+  article_no=as.numeric(article_no),table2_row=as.numeric(table2_row),publication_year=as.numeric(publication_year),primary_eligible=as.numeric(primary_eligible),
+  model_release_date=as.Date(model_release_date),submission_date=as.Date(submission_date),acceptance_date=as.Date(acceptance_date),online_date=as.Date(online_date),
+  across(c(lag_submission_days,lag_acceptance_days,lag_online_days),as.numeric))
+write_tsv<-function(x,path)write.table(x,path,sep="\t",row.names=FALSE,col.names=TRUE,quote=FALSE,fileEncoding="UTF-8")
+desc_stats<-function(x){x<-x[is.finite(x)];if(!length(x))return(data.frame(n=0,mean=NA,sd=NA,median=NA,q1=NA,q3=NA,min=NA,max=NA));data.frame(n=length(x),mean=mean(x),sd=if(length(x)>1)sd(x)else 0,median=median(x),q1=unname(quantile(x,.25)),q3=unname(quantile(x,.75)),min=min(x),max=max(x))}
+mean_or_na<-function(x)if(all(is.na(x)))NA_real_ else mean(x,na.rm=TRUE)
+fmt_p<-function(p)ifelse(is.na(p),"P unavailable",ifelse(p<.001,"P < 0.001",paste0("P = ",sprintf("%.3f",p))))
+pal<-c("#6F4C9F","#D56C9C","#7B8CCB","#B68ACD","#F59B5E","#F6D55C","#9E9E9E","#338333")
+font_family<-"Arial"
+theme_journal<-function(base_size=12)theme_classic(base_size=base_size,base_family=font_family)+theme(text=element_text(colour="#222222"),plot.title=element_text(face="bold",size=base_size+2),plot.subtitle=element_text(colour="#555555",margin=margin(b=8)),plot.caption=element_text(colour="#555555",size=base_size-2,hjust=0,margin=margin(t=8)),axis.title=element_text(face="bold"),legend.title=element_text(face="bold"),legend.position="top",panel.grid.major.y=element_line(colour="#E6E6E6",linewidth=.3),panel.grid.minor=element_blank(),plot.margin=margin(10,14,10,10))
+save_figure<-function(p,stem,width,height){
+  if(!is.null(p$labels$subtitle)&&is.character(p$labels$subtitle))p<-p+labs(subtitle=paste(strwrap(p$labels$subtitle,width=78),collapse="\n"))
+  if(!is.null(p$labels$caption)&&is.character(p$labels$caption))p<-p+labs(caption=paste(strwrap(p$labels$caption,width=105),collapse="\n"))
+  p<-p+theme(plot.caption.position="plot",plot.caption=element_text(lineheight=.95))
+  saveRDS(p,file.path(script_dir,paste0(stem,".plot.rds")))
+  ggsave(file.path(script_dir,paste0(stem,".pdf")),p,device=grDevices::cairo_pdf,width=width,height=height,units="in",bg="white")
+  ggsave(file.path(script_dir,paste0(stem,".png")),p,device="png",dpi=600,width=width,height=height,units="in",bg="white")
+}
+
+map_file<-file.path(project_dir,"ChatGPT_successor_map.txt"); successor<-read_tsv_safe(map_file); names(successor)[1]<-"table2_row"
+successor<-successor |> mutate(table2_row=as.numeric(table2_row),earliest_successor_release_date=as.Date(earliest_successor_release_date))
+gpt<-model_dat |> filter(primary_eligible==1) |> distinct(article_no,table2_row,.keep_all=TRUE) |> inner_join(successor,by="table2_row") |> mutate(supersession_category=case_when((is.na(submission_date)|is.na(acceptance_date))&!is.na(earliest_successor_release_date)&!is.na(online_date)&earliest_successor_release_date<=online_date~"5.Indeterminate timing (missing submission/acceptance)",is.na(earliest_successor_release_date)~"4.Current at publication",!is.na(submission_date)&earliest_successor_release_date<=submission_date~"1.Pre-submission supersession",!is.na(acceptance_date)&earliest_successor_release_date<=acceptance_date~"2.Peer-review supersession",!is.na(online_date)&earliest_successor_release_date<=online_date~"3.Production supersession",TRUE~"4.Current at publication"))
+top<-gpt |> count(canonical_model,sort=TRUE) |> slice_head(n=12) |> pull(canonical_model)
+plot_dat<-gpt |> filter(canonical_model %in% top) |> count(canonical_model,supersession_category,name="n") |> group_by(canonical_model) |> mutate(percent=100*n/sum(n)) |> ungroup() |> mutate(canonical_model=fct_reorder(canonical_model,n,.fun=sum))
+model_levels<-levels(plot_dat$canonical_model)
+category_offset<-c(
+  "1.Pre-submission supersession"=.44,
+  "2.Peer-review supersession"=.22,
+  "3.Production supersession"=0,
+  "4.Current at publication"=-.22,
+  "5.Indeterminate timing (missing submission/acceptance)"=-.44
+)
+model_breaks<-seq_along(model_levels)*1.5
+label_offset<-c(
+  "1.Pre-submission supersession"=.62,
+  "2.Peer-review supersession"=.26,
+  "3.Production supersession"=0,
+  "4.Current at publication"=-.26,
+  "5.Indeterminate timing (missing submission/acceptance)"=-.62
+)
+plot_dat<-plot_dat |> mutate(
+  model_base=as.numeric(canonical_model)*1.5,
+  model_y=model_base+unname(category_offset[supersession_category]),
+  label_y=model_base+unname(label_offset[supersession_category])
+)
+write_tsv(plot_dat,file.path(script_dir,"fig 4d analysis data used.txt"))
+p<-ggplot(plot_dat,aes(percent,model_y,fill=supersession_category))+
+  geom_segment(aes(x=0,xend=percent,yend=model_y,colour=supersession_category),linewidth=.5,alpha=.28,show.legend=FALSE)+
+  geom_point(aes(size=n),shape=21,colour="white",stroke=.7,alpha=.96)+
+  geom_text(show.legend=FALSE,data=plot_dat|>filter(percent>=10),aes(y=label_y,label=paste0(sprintf("%.0f",percent),"% (n=",n,")")),nudge_x=2.1,hjust=0,family=font_family,size=1.9)+
+  scale_fill_manual(values=setNames(pal[c(2,5,3,8,7)],c("1.Pre-submission supersession","2.Peer-review supersession","3.Production supersession","4.Current at publication","5.Indeterminate timing (missing submission/acceptance)")))+
+  scale_colour_manual(values=setNames(pal[c(2,5,3,8,7)],c("1.Pre-submission supersession","2.Peer-review supersession","3.Production supersession","4.Current at publication","5.Indeterminate timing (missing submission/acceptance)")))+
+  scale_size(range=c(2.2,7),guide="none")+
+  scale_x_continuous(labels=function(x)paste0(x,"%"),limits=c(0,110),breaks=c(0,25,50,75,100))+
+  scale_y_continuous(breaks=model_breaks,labels=model_levels,expand=expansion(add=c(.55,.55)))+
+  labs(title="ChatGPT/GPT-family supersession by model",subtitle="Dot profiles for twelve most frequently used model records",x="Article-model occurrences (%)",y=NULL,fill="Supersession class",caption=paste0("Displayed top-12 occurrences = ",sum(plot_dat$n)," of ",nrow(gpt)," mapped ChatGPT/GPT-family article-model occurrences. Missing submission/acceptance dates are shown as indeterminate."))+
+  theme_journal()+theme(panel.grid.major.y=element_blank(),legend.position="bottom")+
+  guides(fill=guide_legend(nrow=3,byrow=TRUE))+theme(legend.text=element_text(size=7),legend.key.width=grid::unit(.55,"cm"))
+save_figure(p,"Figure 4 D ChatGPT GPT supersession by model",10.5,7)
