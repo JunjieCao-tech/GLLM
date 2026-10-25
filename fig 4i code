@@ -1,0 +1,76 @@
+# Specific-model cross-study comparisons with article-cluster bootstrap
+required_packages<-c("ggplot2","dplyr","tidyr","forcats","scales")
+missing_packages<-required_packages[!vapply(required_packages,requireNamespace,logical(1),quietly=TRUE)]
+if(length(missing_packages)>0)install.packages(missing_packages,repos="https://cloud.r-project.org",dependencies=TRUE)
+suppressPackageStartupMessages({library(ggplot2);library(dplyr);library(tidyr);library(forcats);library(scales)})
+get_script_dir<-function(){override<-Sys.getenv("LLM_LAG_SCRIPT_DIR",unset="");if(nzchar(override))return(normalizePath(override,mustWork=TRUE));args<-commandArgs(trailingOnly=FALSE);f<-grep("^--file=",args,value=TRUE);if(length(f))return(dirname(normalizePath(sub("^--file=","",f[1]))));normalizePath(getwd())}
+script_dir<-get_script_dir();project_dir<-normalizePath(file.path(script_dir,".."),mustWork=FALSE)
+read_tsv<-function(path){
+  if(!file.exists(path))stop("Missing input: ",path)
+  for(enc in c("UTF-8","UTF-8-BOM","GB18030","GBK")){
+    lines<-tryCatch(readLines(path,encoding=enc,warn=FALSE),error=function(e)NULL)
+    if(is.null(lines)||length(lines)<2)next
+    x<-tryCatch(read.delim(textConnection(lines),sep="\t",header=TRUE,quote="",fill=TRUE,comment.char="",stringsAsFactors=FALSE,check.names=FALSE,na.strings=c("","NA","N/A")),error=function(e)NULL)
+    if(!is.null(x)&&nrow(x)>1)return(x)
+  }
+  stop("Cannot read input: ",path)
+}
+write_tsv<-function(x,path)write.table(x,path,sep="\t",row.names=FALSE,col.names=TRUE,quote=FALSE,fileEncoding="UTF-8")
+pal<-c("#6F4C9F","#D56C9C","#7B8CCB","#B68ACD","#F59B5E","#F6D55C","#9E9E9E","#338333")
+
+d<-read_tsv(file.path(project_dir,"main_model.txt"))|>
+  mutate(article_no=as.numeric(article_no),table2_row=as.numeric(table2_row),primary_eligible=as.numeric(primary_eligible),lag_submission_days=as.numeric(lag_submission_days),model=trimws(canonical_model_en))|>
+  filter(primary_eligible==1,is.finite(lag_submission_days),nzchar(model))|>
+  distinct(article_no,model,.keep_all=TRUE)|>
+  select(article_no,model,lag_submission_days)
+
+prob_stats<-function(a,b){
+  dif<-outer(a$lag_submission_days,b$lag_submission_days,"-")
+  n_pairs<-length(dif);pa<-sum(dif>0)/n_pairs;pb<-sum(dif<0)/n_pairs;pt<-sum(dif==0)/n_pairs
+  c(a_longer=pa,b_longer=pb,tie=pt,delta=pa-pb,pairs=n_pairs)
+}
+cluster_boot<-function(a,b,B=1000,seed=1){
+  ids<-sort(unique(c(a$article_no,b$article_no)));set.seed(seed)
+  ans<-matrix(NA_real_,B,2,dimnames=list(NULL,c("a_longer","delta")))
+  for(i in seq_len(B)){
+    tab<-table(sample(ids,length(ids),replace=TRUE));wa<-tab[as.character(a$article_no)];wb<-tab[as.character(b$article_no)];wa[is.na(wa)]<-0;wb[is.na(wb)]<-0
+    xa<-rep(a$lag_submission_days,as.integer(wa));xb<-rep(b$lag_submission_days,as.integer(wb));if(!length(xa)||!length(xb))next
+    dif<-outer(xa,xb,"-");pa<-mean(dif>0);pb<-mean(dif<0);ans[i,]<-c(pa,pa-pb)
+  }
+  c(a_low=unname(quantile(ans[,1],.025,na.rm=TRUE)),a_high=unname(quantile(ans[,1],.975,na.rm=TRUE)),delta_low=unname(quantile(ans[,2],.025,na.rm=TRUE)),delta_high=unname(quantile(ans[,2],.975,na.rm=TRUE)))
+}
+pair_table<-function(min_articles,bootstrap=FALSE,B=1000){
+  keep<-d|>count(model,name="n")|>filter(n>=min_articles)|>pull(model);pairs<-combn(keep,2,simplify=FALSE)
+  out<-bind_rows(lapply(seq_along(pairs),function(i){
+    z<-pairs[[i]];a<-d|>filter(model==z[1]);b<-d|>filter(model==z[2]);s<-prob_stats(a,b);mw<-suppressWarnings(wilcox.test(a$lag_submission_days,b$lag_submission_days,exact=FALSE))
+    ci<-if(bootstrap)cluster_boot(a,b,B=B,seed=20261018+i) else c(a_low=NA,a_high=NA,delta_low=NA,delta_high=NA)
+    data.frame(model_a=z[1],model_b=z[2],n_a=nrow(a),n_b=nrow(b),overlap_articles=length(intersect(a$article_no,b$article_no)),cross_article_pairs=s[["pairs"]],model_a_longer_pct=100*s[["a_longer"]],model_b_longer_pct=100*s[["b_longer"]],tie_pct=100*s[["tie"]],cliffs_delta=s[["delta"]],a_longer_ci_low=100*ci[["a_low"]],a_longer_ci_high=100*ci[["a_high"]],cliffs_delta_ci_low=ci[["delta_low"]],cliffs_delta_ci_high=ci[["delta_high"]],mann_whitney_p=mw$p.value)
+  }))
+  out|>mutate(mann_whitney_p_BH=p.adjust(mann_whitney_p,"BH"),min_model_n=pmin(n_a,n_b),analysis=ifelse(bootstrap,"Primary: each model in >=10 articles; 1000 article-cluster bootstrap replicates","Exploratory: each model in >=5 articles; descriptive estimates"))
+}
+
+primary_path<-file.path(script_dir,"fig 3i primary model-pair summary with cluster-bootstrap CI.txt")
+exploratory_path<-file.path(script_dir,"fig 3i exploratory model-pair summary n5.txt")
+use_cache<-Sys.getenv("LLM_PAIRWISE_USE_CACHE",unset="0")=="1"&&file.exists(primary_path)&&file.exists(exploratory_path)
+if(use_cache){primary<-read_tsv(primary_path);exploratory<-read_tsv(exploratory_path)}else{
+  primary<-pair_table(10,bootstrap=TRUE,B=1000);exploratory<-pair_table(5,bootstrap=FALSE)
+  write_tsv(primary,primary_path);write_tsv(exploratory,exploratory_path)
+}
+write_tsv(d,file.path(script_dir,"fig 3i analysis data used.txt"))
+
+plot_wide<-primary|>arrange(desc(min_model_n),desc(cross_article_pairs))|>slice_head(n=12)|>
+  mutate(pair=paste0(model_a,"  vs  ",model_b,"\n(nA=",n_a,", nB=",n_b,", shared articles=",overlap_articles,")"),pair=factor(pair,levels=rev(pair)),direction=if_else(model_a_longer_pct>=50,"Model A more often longer","Model B more often longer"))
+caption_i<-paste(strwrap("Each point compares every article using Model A with every article using Model B. The dashed 50% line indicates equal probability. Shared articles are preserved as clusters; nA x nB comparisons are descriptive and are not treated as independent sample size. Ties are reported in the full table.",width=150),collapse="\n")
+p<-ggplot(plot_wide,aes(y=pair,x=model_a_longer_pct,colour=direction))+
+  geom_vline(xintercept=50,linetype=2,linewidth=.55,colour=pal[7])+
+  geom_errorbar(aes(xmin=a_longer_ci_low,xmax=a_longer_ci_high),orientation="y",width=.18,linewidth=.85,colour="#444444")+
+  geom_point(size=3.8,shape=21,fill="white",stroke=1.25)+
+  geom_text(aes(x=98,label=paste0("A ",round(model_a_longer_pct,1),"% | B ",round(model_b_longer_pct,1),"%")),hjust=1,size=3.0,colour="#555555")+
+  scale_colour_manual(values=c("Model A more often longer"=pal[1],"Model B more often longer"=pal[5]))+
+  scale_x_continuous(labels=function(x)paste0(x,"%"),breaks=seq(0,100,25),expand=expansion(mult=c(.01,.01)))+coord_cartesian(xlim=c(0,100))+
+  labs(title="Probability that Model A has the longer submission lag",subtitle="Forest plot of cross-study common-language probabilities; 12 best-supported model pairs",x="Model A-longer probability (article-cluster bootstrap 95% CI)",y=NULL,colour=NULL,caption=caption_i)+
+  theme_classic(base_size=11,base_family="Arial")+theme(text=element_text(colour="#222222"),plot.title=element_text(face="bold",size=15),plot.subtitle=element_text(colour="#555555"),plot.caption=element_text(colour="#555555",hjust=0,size=9,lineheight=.95,margin=margin(t=8)),axis.title=element_text(face="bold"),axis.text.y=element_text(size=8.2,lineheight=.92),legend.position="top",panel.grid.major.x=element_line(colour="#ECECEC",linewidth=.35),plot.margin=margin(10,22,10,10))
+saveRDS(p,file.path(script_dir,"Figure 3 I Specific-model pairwise dominance.plot.rds"))
+ggsave(file.path(script_dir,"Figure 3 I Specific-model pairwise dominance.pdf"),p,device=grDevices::cairo_pdf,width=12.5,height=9.2,units="in",bg="white")
+ggsave(file.path(script_dir,"Figure 3 I Specific-model pairwise dominance.png"),p,device="png",dpi=600,width=12.5,height=9.2,units="in",bg="white")
+writeLines(c("Primary eligibility: each exact canonical model was used in at least 10 articles.",paste0("Primary models: ",n_distinct(c(primary$model_a,primary$model_b))),paste0("Primary pairwise comparisons: ",nrow(primary)),"Inference: 1000 article-ID cluster bootstrap replicates; each replicate resamples the union of article IDs and preserves multi-model articles as clusters.","Mann-Whitney P values are retained as secondary conventional statistics; inference emphasizes the cluster-bootstrap confidence intervals.",paste0("Exploratory threshold: at least 5 articles; pairs = ",nrow(exploratory))),file.path(script_dir,"fig 3i statistical results.txt"))
