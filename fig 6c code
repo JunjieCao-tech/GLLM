@@ -1,0 +1,60 @@
+required_packages<-c("ggplot2","dplyr","tidyr","scales")
+missing_packages<-required_packages[!vapply(required_packages,requireNamespace,logical(1),quietly=TRUE)]
+if(length(missing_packages)>0)install.packages(missing_packages,repos="https://cloud.r-project.org",dependencies=TRUE)
+suppressPackageStartupMessages({library(ggplot2);library(dplyr);library(tidyr);library(scales)})
+get_script_dir<-function(){
+ override<-Sys.getenv("LLM_LAG_SCRIPT_DIR",unset="")
+ if(nzchar(override))return(normalizePath(override,mustWork=TRUE))
+ args<-commandArgs(trailingOnly=FALSE);f<-grep("^--file=",args,value=TRUE)
+ if(length(f))return(dirname(normalizePath(sub("^--file=","",f[1]))))
+ if(requireNamespace("rstudioapi",quietly=TRUE)&&rstudioapi::isAvailable()){p<-rstudioapi::getActiveDocumentContext()$path;if(nzchar(p))return(dirname(normalizePath(p)))}
+ normalizePath(getwd())
+}
+script_dir<-get_script_dir();project_dir<-normalizePath(file.path(script_dir,".."),mustWork=TRUE)
+read_tsv<-function(p){
+ if(!file.exists(p))stop("Missing input: ",p)
+ for(enc in c("UTF-8","UTF-8-BOM","GB18030","GBK")){
+  lines<-tryCatch(readLines(p,encoding=enc,warn=FALSE),error=function(e)NULL)
+  if(is.null(lines)||length(lines)<2)next
+  x<-tryCatch(read.delim(textConnection(lines),sep="\t",header=TRUE,quote="",fill=TRUE,comment.char="",stringsAsFactors=FALSE,check.names=FALSE,na.strings=c("","NA","N/A")),error=function(e)NULL)
+  if(!is.null(x)&&nrow(x)>0)return(x)
+ }
+ stop("Cannot read: ",p)
+}
+article<-read_tsv(file.path(project_dir,"figure5_article_data.txt"))
+pre<-article|>filter(preprint_status=="Yes")
+num<-function(x)suppressWarnings(as.numeric(x))
+article<-article|>mutate(publication_year=num(publication_year),lag_online_mean_days=num(lag_online_mean_days))
+pre<-pre|>mutate(publication_year=num(publication_year),across(c(preprint_to_submission_days,preprint_to_acceptance_days,preprint_to_online_days,preprint_strict_gllm_count,final_strict_gllm_count,preprint_final_jaccard,preprint_models_retained,final_models_added,preprint_models_removed,model_turnover_count,review_delay_days,production_delay_days),num))
+pal<-c("#6F4C9F","#D56C9C","#7B8CCB","#B68ACD","#F59B5E","#F6D55C","#9E9E9E","#338333")
+font_family<-"Arial"
+theme_journal<-function(base_size=13)theme_classic(base_size=base_size,base_family=font_family)+theme(
+ text=element_text(colour="#222222"),plot.title=element_text(face="bold",size=base_size+2),
+ plot.subtitle=element_text(colour="#555555",margin=margin(b=9)),plot.caption=element_text(colour="#555555",size=base_size-2,hjust=0,margin=margin(t=9)),
+ axis.title=element_text(face="bold"),legend.title=element_text(face="bold"),legend.position="top",
+ panel.grid.major.y=element_line(colour="#E8E8E8",linewidth=.35),panel.grid.minor=element_blank(),
+ plot.margin=margin(12,18,12,12))
+fmt_p<-function(p)ifelse(is.na(p),"P unavailable",ifelse(p<.001,"P < 0.001",paste0("P = ",formatC(p,format="f",digits=3))))
+write_tsv<-function(x,p)write.table(x,p,sep="\t",row.names=FALSE,col.names=TRUE,quote=FALSE,fileEncoding="UTF-8")
+save_panel<-function(p,stem,w=10.5,h=7.2){
+ saveRDS(p,file.path(script_dir,paste0(stem,".plot.rds")))
+ ggsave(file.path(script_dir,paste0(stem,".pdf")),p,device=grDevices::cairo_pdf,width=w,height=h,units="in",bg="white")
+ ggsave(file.path(script_dir,paste0(stem,".png")),p,device="png",dpi=600,width=w,height=h,units="in",bg="white")
+}
+
+d<-pre|>select(article_no,preprint_to_submission_days,preprint_to_acceptance_days,preprint_to_online_days)|>
+ pivot_longer(-article_no,names_to="milestone",values_to="days")|>filter(is.finite(days))|>
+ mutate(milestone=factor(milestone,levels=c("preprint_to_submission_days","preprint_to_acceptance_days","preprint_to_online_days"),
+ labels=c("Submission","Acceptance","Online publication")))
+s<-d|>group_by(milestone)|>summarise(n=n(),median=median(days),q1=quantile(days,.25),q3=quantile(days,.75),.groups="drop")
+ann<-s|>mutate(label=paste0("Median ",round(median)," d\nIQR ",round(q1),"-",round(q3),"; n=",n),label_y=max(d$days,na.rm=TRUE)+125)
+set.seed(20261020)
+p<-ggplot(d,aes(milestone,days,fill=milestone,colour=milestone))+geom_violin(alpha=.18,linewidth=.9,trim=FALSE)+
+ geom_boxplot(width=.18,outlier.shape=NA,alpha=.55,colour="#303030",linewidth=.65)+
+ geom_jitter(width=.10,size=2.1,alpha=.58,stroke=0)+geom_hline(yintercept=0,linetype=2,colour=pal[7])+
+ geom_text(data=ann,aes(milestone,label_y,label=label,colour=milestone),inherit.aes=FALSE,size=3.5,family=font_family,fontface="bold",lineheight=.95)+
+ scale_fill_manual(values=pal[c(1,2,3)],guide="none")+scale_colour_manual(values=pal[c(1,2,3)],guide="none")+
+ labs(title="Time from preprint posting to manuscript milestones",subtitle="Raincloud distributions show every article, the median and interquartile range",x=NULL,y="Interval (days)",
+ caption="Positive values mean the preprint preceded the milestone; negative values mean it was posted after that milestone.")+theme_journal()
+write_tsv(d,file.path(script_dir,"fig 5c analysis data used.txt"));write_tsv(s,file.path(script_dir,"fig 5c statistical results.txt"))
+save_panel(p,"Figure 5 C Preprint-to-milestone intervals")
