@@ -1,0 +1,62 @@
+required_packages<-c("ggplot2","dplyr","tidyr","scales")
+missing_packages<-required_packages[!vapply(required_packages,requireNamespace,logical(1),quietly=TRUE)]
+if(length(missing_packages)>0)install.packages(missing_packages,repos="https://cloud.r-project.org",dependencies=TRUE)
+suppressPackageStartupMessages({library(ggplot2);library(dplyr);library(tidyr);library(scales)})
+get_script_dir<-function(){
+ override<-Sys.getenv("LLM_LAG_SCRIPT_DIR",unset="")
+ if(nzchar(override))return(normalizePath(override,mustWork=TRUE))
+ args<-commandArgs(trailingOnly=FALSE);f<-grep("^--file=",args,value=TRUE)
+ if(length(f))return(dirname(normalizePath(sub("^--file=","",f[1]))))
+ if(requireNamespace("rstudioapi",quietly=TRUE)&&rstudioapi::isAvailable()){p<-rstudioapi::getActiveDocumentContext()$path;if(nzchar(p))return(dirname(normalizePath(p)))}
+ normalizePath(getwd())
+}
+script_dir<-get_script_dir();project_dir<-normalizePath(file.path(script_dir,".."),mustWork=TRUE)
+read_tsv<-function(p){
+ if(!file.exists(p))stop("Missing input: ",p)
+ for(enc in c("UTF-8","UTF-8-BOM","GB18030","GBK")){
+  lines<-tryCatch(readLines(p,encoding=enc,warn=FALSE),error=function(e)NULL)
+  if(is.null(lines)||length(lines)<2)next
+  x<-tryCatch(read.delim(textConnection(lines),sep="\t",header=TRUE,quote="",fill=TRUE,comment.char="",stringsAsFactors=FALSE,check.names=FALSE,na.strings=c("","NA","N/A")),error=function(e)NULL)
+  if(!is.null(x)&&nrow(x)>0)return(x)
+ }
+ stop("Cannot read: ",p)
+}
+article<-read_tsv(file.path(project_dir,"figure5_article_data.txt"))
+pre<-article|>filter(preprint_status=="Yes")
+num<-function(x)suppressWarnings(as.numeric(x))
+article<-article|>mutate(publication_year=num(publication_year),lag_online_mean_days=num(lag_online_mean_days))
+pre<-pre|>mutate(publication_year=num(publication_year),across(c(preprint_to_submission_days,preprint_to_acceptance_days,preprint_to_online_days,preprint_strict_gllm_count,final_strict_gllm_count,preprint_final_jaccard,preprint_models_retained,final_models_added,preprint_models_removed,model_turnover_count,review_delay_days,production_delay_days),num))
+pal<-c("#6F4C9F","#D56C9C","#7B8CCB","#B68ACD","#F59B5E","#F6D55C","#9E9E9E","#338333")
+font_family<-"Arial"
+theme_journal<-function(base_size=13)theme_classic(base_size=base_size,base_family=font_family)+theme(
+ text=element_text(colour="#222222"),plot.title=element_text(face="bold",size=base_size+2),
+ plot.subtitle=element_text(colour="#555555",margin=margin(b=9)),plot.caption=element_text(colour="#555555",size=base_size-2,hjust=0,margin=margin(t=9)),
+ axis.title=element_text(face="bold"),legend.title=element_text(face="bold"),legend.position="top",
+ panel.grid.major.y=element_line(colour="#E8E8E8",linewidth=.35),panel.grid.minor=element_blank(),
+ plot.margin=margin(12,18,12,12))
+fmt_p<-function(p)ifelse(is.na(p),"P unavailable",ifelse(p<.001,"P < 0.001",paste0("P = ",formatC(p,format="f",digits=3))))
+write_tsv<-function(x,p)write.table(x,p,sep="\t",row.names=FALSE,col.names=TRUE,quote=FALSE,fileEncoding="UTF-8")
+save_panel<-function(p,stem,w=10.5,h=7.2){
+ saveRDS(p,file.path(script_dir,paste0(stem,".plot.rds")))
+ ggsave(file.path(script_dir,paste0(stem,".pdf")),p,device=grDevices::cairo_pdf,width=w,height=h,units="in",bg="white")
+ ggsave(file.path(script_dir,paste0(stem,".png")),p,device="png",dpi=600,width=w,height=h,units="in",bg="white")
+}
+
+year_dat<-article|>filter(publication_year%in%2022:2026)|>group_by(publication_year)|>summarise(total=n(),preprints=sum(preprint_status=="Yes",na.rm=TRUE),.groups="drop")|>rowwise()|>mutate(
+ prop=preprints/total,
+ lo=if(preprints==0)0 else prop.test(preprints,total,correct=FALSE)$conf.int[1],
+ hi=if(preprints==total)1 else prop.test(preprints,total,correct=FALSE)$conf.int[2],
+ label=paste0(preprints,"/",total,"\n",percent(prop,accuracy=.1)),
+ year_label=ifelse(publication_year==2026,"2026\n(partial) ",as.character(publication_year)))|>ungroup()
+trend<-glm(cbind(preprints,total-preprints)~publication_year,family=binomial,data=filter(year_dat,publication_year<=2025))
+ptrend<-coef(summary(trend))[2,4]
+p<-ggplot(year_dat,aes(publication_year,prop))+geom_line(colour=pal[1],linewidth=1)+
+ geom_linerange(aes(ymin=lo,ymax=hi),colour=pal[1],linewidth=1)+
+ geom_point(aes(fill=publication_year==2026),shape=21,size=5,stroke=1.1,colour=pal[1])+
+ geom_text(aes(label=label),vjust=-1.05,size=3.8,family=font_family,lineheight=.9)+
+ scale_fill_manual(values=c("FALSE"=pal[3],"TRUE"=pal[6]),guide="none")+
+ scale_x_continuous(breaks=2022:2026,labels=year_dat$year_label)+scale_y_continuous(labels=percent_format(accuracy=1),limits=c(0,max(year_dat$hi)*1.22))+
+ labs(title="Preprint prevalence over time",subtitle="Article-level proportions with Wilson 95% confidence intervals",x="Publication year",y="Articles with a preprint",
+ caption=paste0("Binomial trend through complete publication years 2022-2025: ",fmt_p(ptrend),". 2026 is partial through 14 Sep 2026."))+theme_journal()
+write_tsv(year_dat,file.path(script_dir,"fig 5a analysis data used.txt"));writeLines(capture.output(summary(trend)),file.path(script_dir,"fig 5a statistical results.txt"))
+save_panel(p,"Figure 5 A Preprint prevalence over time")
