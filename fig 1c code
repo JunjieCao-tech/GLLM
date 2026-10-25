@@ -1,0 +1,63 @@
+# ============================================================
+# LLM obsolescence study: reproducible figure script
+# Inputs: main_article.txt and main_model.txt in the package root
+# Outputs: analysis data, statistical results, 600 dpi PNG and vector PDF
+# ============================================================
+required_packages <- c("ggplot2","dplyr","tidyr","forcats","scales","sandwich","lmtest")
+missing_packages <- required_packages[!vapply(required_packages,requireNamespace,logical(1),quietly=TRUE)]
+if(length(missing_packages)>0) install.packages(missing_packages,repos="https://cloud.r-project.org",dependencies=TRUE)
+suppressPackageStartupMessages({library(ggplot2);library(dplyr);library(tidyr);library(forcats);library(scales)})
+get_script_dir <- function(){
+  override<-Sys.getenv("LLM_LAG_SCRIPT_DIR",unset="")
+  if(nzchar(override))return(normalizePath(override,mustWork=TRUE))
+  args<-commandArgs(trailingOnly=FALSE); f<-grep("^--file=",args,value=TRUE)
+  if(length(f)>0)return(dirname(normalizePath(sub("^--file=","",f[1]))))
+  if(requireNamespace("rstudioapi",quietly=TRUE)&&rstudioapi::isAvailable()){
+    p<-rstudioapi::getActiveDocumentContext()$path;if(nzchar(p))return(dirname(normalizePath(p)))
+  }
+  normalizePath(getwd())
+}
+script_dir<-get_script_dir(); project_dir<-normalizePath(file.path(script_dir,".."),mustWork=FALSE)
+read_tsv_safe<-function(path){
+  if(!file.exists(path))stop("Missing input: ",path)
+  for(enc in c("UTF-8","UTF-8-BOM","GB18030","GBK")){
+    lines<-tryCatch(readLines(path,encoding=enc,warn=FALSE),error=function(e)NULL)
+    if(is.null(lines)||length(lines)<2)next
+    x<-tryCatch(read.delim(textConnection(lines),sep="\t",header=TRUE,quote="\"",fill=TRUE,comment.char="",stringsAsFactors=FALSE,check.names=FALSE,na.strings=c("","NA","N/A")),error=function(e)NULL)
+    if(!is.null(x)&&nrow(x)>1)return(x)
+  }
+  stop("Cannot read: ",path)
+}
+article_dat<-read_tsv_safe(file.path(project_dir,"main_article.txt"))|>mutate(
+  article_no=as.numeric(article_no),publication_year=as.numeric(publication_year),model_count=as.numeric(model_count),mapped_model_count=as.numeric(mapped_model_count),mapping_coverage=as.numeric(mapping_coverage),
+  across(c(lag_submission_mean_days,lag_acceptance_mean_days,lag_online_mean_days,review_delay_days,production_delay_days,total_editorial_delay_days),as.numeric),
+  submission_date=as.Date(submission_date),acceptance_date=as.Date(acceptance_date),online_date=as.Date(online_date),
+  any_nonpositive_submission=tolower(as.character(any_nonpositive_submission))%in%c("true","1"),has_lamda=tolower(as.character(has_lamda))%in%c("true","1"))
+model_dat<-read_tsv_safe(file.path(project_dir,"main_model.txt"))|>mutate(
+  article_no=as.numeric(article_no),table2_row=as.numeric(table2_row),publication_year=as.numeric(publication_year),primary_eligible=as.numeric(primary_eligible),
+  model_release_date=as.Date(model_release_date),submission_date=as.Date(submission_date),acceptance_date=as.Date(acceptance_date),online_date=as.Date(online_date),
+  across(c(lag_submission_days,lag_acceptance_days,lag_online_days),as.numeric))
+write_tsv<-function(x,path)write.table(x,path,sep="\t",row.names=FALSE,col.names=TRUE,quote=FALSE,fileEncoding="UTF-8")
+desc_stats<-function(x){x<-x[is.finite(x)];if(!length(x))return(data.frame(n=0,mean=NA,sd=NA,median=NA,q1=NA,q3=NA,min=NA,max=NA));data.frame(n=length(x),mean=mean(x),sd=if(length(x)>1)sd(x)else 0,median=median(x),q1=unname(quantile(x,.25)),q3=unname(quantile(x,.75)),min=min(x),max=max(x))}
+mean_or_na<-function(x)if(all(is.na(x)))NA_real_ else mean(x,na.rm=TRUE)
+fmt_p<-function(p)ifelse(is.na(p),"P unavailable",ifelse(p<.001,"P < 0.001",paste0("P = ",sprintf("%.3f",p))))
+pal<-c("#6F4C9F","#D56C9C","#7B8CCB","#B68ACD","#F59B5E","#F6D55C","#9E9E9E","#338333")
+font_family<-"Arial"
+theme_journal<-function(base_size=12)theme_classic(base_size=base_size,base_family=font_family)+theme(text=element_text(colour="#222222"),plot.title=element_text(face="bold",size=base_size+2),plot.subtitle=element_text(colour="#555555",margin=margin(b=8)),plot.caption=element_text(colour="#555555",size=base_size-2,hjust=0,margin=margin(t=8)),axis.title=element_text(face="bold"),legend.title=element_text(face="bold"),legend.position="top",panel.grid.major.y=element_line(colour="#E6E6E6",linewidth=.3),panel.grid.minor=element_blank(),plot.margin=margin(10,14,10,10))
+save_figure<-function(p,stem,width,height){
+  if(!is.null(p$labels$subtitle)&&is.character(p$labels$subtitle))p<-p+labs(subtitle=paste(strwrap(p$labels$subtitle,width=78),collapse="\n"))
+  if(!is.null(p$labels$caption)&&is.character(p$labels$caption))p<-p+labs(caption=paste(strwrap(p$labels$caption,width=105),collapse="\n"))
+  p<-p+theme(plot.caption.position="plot",plot.caption=element_text(lineheight=.95))
+  saveRDS(p,file.path(script_dir,paste0(stem,".plot.rds")))
+  ggsave(file.path(script_dir,paste0(stem,".pdf")),p,device=grDevices::cairo_pdf,width=width,height=height,units="in",bg="white")
+  ggsave(file.path(script_dir,paste0(stem,".png")),p,device="png",dpi=600,width=width,height=height,units="in",bg="white")
+}
+
+plot_dat<-article_dat|>select(article_no,publication_year,lag_submission_mean_days,review_delay_days,production_delay_days)|>pivot_longer(c(lag_submission_mean_days,review_delay_days,production_delay_days),names_to="component",values_to="days")|>filter(is.finite(publication_year),is.finite(days))|>mutate(component=factor(component,levels=c("lag_submission_mean_days","review_delay_days","production_delay_days"),labels=c("Release to submission","Peer review","Production")))
+annual<-plot_dat|>group_by(publication_year,component)|>summarise(n=n(),median=median(days),q1=quantile(days,.25),q3=quantile(days,.75),.groups="drop")
+tests<-plot_dat|>group_by(component)|>group_modify(~{z<-cor.test(.x$publication_year,.x$days,method="spearman",exact=FALSE);data.frame(n=nrow(.x),rho=unname(z$estimate),p_value=z$p.value)})|>ungroup()|>mutate(p_adj_BH=p.adjust(p_value,"BH"))
+write_tsv(annual,file.path(script_dir,"fig 1c analysis data used.txt"));write_tsv(tests,file.path(script_dir,"fig 1c statistical results.txt"))
+cap<-paste(paste0(tests$component,": rho=",sprintf("%.2f",tests$rho),", BH P=",format.pval(tests$p_adj_BH,digits=2)),collapse="; ")
+p<-ggplot(annual,aes(publication_year,median,colour=component,fill=component,group=component))+geom_ribbon(aes(ymin=q1,ymax=q3),alpha=.1,colour=NA)+geom_line(linewidth=1)+geom_point(size=2.7)+scale_colour_manual(values=pal[c(1,5,8)])+scale_fill_manual(values=pal[c(1,5,8)])+scale_x_continuous(breaks=sort(unique(annual$publication_year)))+labs(title="Components of publication lag over time",subtitle="Median and interquartile range by publication year",x="Publication year",y="Duration (days)",colour=NULL,fill=NULL,caption=cap)+theme_journal()
+year_n<-article_dat|>filter(is.finite(publication_year))|>count(publication_year,name="articles");year_labels<-setNames(paste0(year_n$publication_year,ifelse(year_n$publication_year==2026," (partial to 14 Sep)",""),"\n(n=",year_n$articles,")"),year_n$publication_year);p<-p+geom_text(show.legend=FALSE,aes(label=round(median)),vjust=-.65,family=font_family,size=2.5,check_overlap=TRUE)+scale_x_continuous(breaks=year_n$publication_year,labels=year_labels)+labs(subtitle="Median and interquartile range; year labels show the number of included articles",caption=paste0(cap,". The 2026 display is partial through 14 Sep 2026."))
+save_figure(p,"Figure 1 C Components of publication lag over time",8.6,5.7)
