@@ -1,0 +1,97 @@
+# ============================================================
+# LLM obsolescence study: reproducible figure script
+# Inputs: main_article.txt and main_model.txt in the package root
+# Outputs: analysis data, statistical results, 600 dpi PNG and vector PDF
+# ============================================================
+required_packages <- c("ggplot2","dplyr","tidyr","forcats","scales","sandwich","lmtest")
+missing_packages <- required_packages[!vapply(required_packages,requireNamespace,logical(1),quietly=TRUE)]
+if(length(missing_packages)>0) install.packages(missing_packages,repos="https://cloud.r-project.org",dependencies=TRUE)
+suppressPackageStartupMessages({library(ggplot2);library(dplyr);library(tidyr);library(forcats);library(scales)})
+get_script_dir <- function(){
+  override<-Sys.getenv("LLM_LAG_SCRIPT_DIR",unset="")
+  if(nzchar(override))return(normalizePath(override,mustWork=TRUE))
+  args<-commandArgs(trailingOnly=FALSE); f<-grep("^--file=",args,value=TRUE)
+  if(length(f)>0)return(dirname(normalizePath(sub("^--file=","",f[1]))))
+  if(requireNamespace("rstudioapi",quietly=TRUE)&&rstudioapi::isAvailable()){
+    p<-rstudioapi::getActiveDocumentContext()$path;if(nzchar(p))return(dirname(normalizePath(p)))
+  }
+  normalizePath(getwd())
+}
+script_dir<-get_script_dir(); project_dir<-normalizePath(file.path(script_dir,".."),mustWork=FALSE)
+read_tsv_safe<-function(path){
+  if(!file.exists(path))stop("Missing input: ",path)
+  for(enc in c("UTF-8","UTF-8-BOM","GB18030","GBK")){
+    lines<-tryCatch(readLines(path,encoding=enc,warn=FALSE),error=function(e)NULL)
+    if(is.null(lines)||length(lines)<2)next
+    x<-tryCatch(read.delim(textConnection(lines),sep="\t",header=TRUE,quote="\"",fill=TRUE,comment.char="",stringsAsFactors=FALSE,check.names=FALSE,na.strings=c("","NA","N/A")),error=function(e)NULL)
+    if(!is.null(x)&&nrow(x)>1)return(x)
+  }
+  stop("Cannot read: ",path)
+}
+article_dat<-read_tsv_safe(file.path(project_dir,"main_article.txt"))|>mutate(
+  article_no=as.numeric(article_no),publication_year=as.numeric(publication_year),model_count=as.numeric(model_count),mapped_model_count=as.numeric(mapped_model_count),mapping_coverage=as.numeric(mapping_coverage),
+  across(c(lag_submission_mean_days,lag_acceptance_mean_days,lag_online_mean_days,review_delay_days,production_delay_days,total_editorial_delay_days),as.numeric),
+  submission_date=as.Date(submission_date),acceptance_date=as.Date(acceptance_date),online_date=as.Date(online_date),
+  any_nonpositive_submission=tolower(as.character(any_nonpositive_submission))%in%c("true","1"),has_lamda=tolower(as.character(has_lamda))%in%c("true","1"))
+model_dat<-read_tsv_safe(file.path(project_dir,"main_model.txt"))|>mutate(
+  article_no=as.numeric(article_no),table2_row=as.numeric(table2_row),publication_year=as.numeric(publication_year),primary_eligible=as.numeric(primary_eligible),
+  model_release_date=as.Date(model_release_date),submission_date=as.Date(submission_date),acceptance_date=as.Date(acceptance_date),online_date=as.Date(online_date),
+  across(c(lag_submission_days,lag_acceptance_days,lag_online_days),as.numeric))
+write_tsv<-function(x,path)write.table(x,path,sep="\t",row.names=FALSE,col.names=TRUE,quote=FALSE,fileEncoding="UTF-8")
+desc_stats<-function(x){x<-x[is.finite(x)];if(!length(x))return(data.frame(n=0,mean=NA,sd=NA,median=NA,q1=NA,q3=NA,min=NA,max=NA));data.frame(n=length(x),mean=mean(x),sd=if(length(x)>1)sd(x)else 0,median=median(x),q1=unname(quantile(x,.25)),q3=unname(quantile(x,.75)),min=min(x),max=max(x))}
+mean_or_na<-function(x)if(all(is.na(x)))NA_real_ else mean(x,na.rm=TRUE)
+fmt_p<-function(p)ifelse(is.na(p),"P unavailable",ifelse(p<.001,"P < 0.001",paste0("P = ",sprintf("%.3f",p))))
+pal<-c("#6F4C9F","#D56C9C","#7B8CCB","#B68ACD","#F59B5E","#F6D55C","#9E9E9E","#338333")
+font_family<-"Arial"
+theme_journal<-function(base_size=12)theme_classic(base_size=base_size,base_family=font_family)+theme(text=element_text(colour="#222222"),plot.title=element_text(face="bold",size=base_size+2),plot.subtitle=element_text(colour="#555555",margin=margin(b=8)),plot.caption=element_text(colour="#555555",size=base_size-2,hjust=0,margin=margin(t=8)),axis.title=element_text(face="bold"),legend.title=element_text(face="bold"),legend.position="top",panel.grid.major.y=element_line(colour="#E6E6E6",linewidth=.3),panel.grid.minor=element_blank(),plot.margin=margin(10,14,10,10))
+save_figure<-function(p,stem,width,height){
+  if(!is.null(p$labels$subtitle)&&is.character(p$labels$subtitle))p<-p+labs(subtitle=paste(strwrap(p$labels$subtitle,width=78),collapse="\n"))
+  if(!is.null(p$labels$caption)&&is.character(p$labels$caption))p<-p+labs(caption=paste(strwrap(p$labels$caption,width=105),collapse="\n"))
+  p<-p+theme(plot.caption.position="plot",plot.caption=element_text(lineheight=.95))
+  saveRDS(p,file.path(script_dir,paste0(stem,".plot.rds")))
+  ggsave(file.path(script_dir,paste0(stem,".pdf")),p,device=grDevices::cairo_pdf,width=width,height=height,units="in",bg="white")
+  ggsave(file.path(script_dir,paste0(stem,".png")),p,device="png",dpi=600,width=width,height=height,units="in",bg="white")
+}
+
+d<-article_dat|>filter(is.finite(lag_submission_mean_days),is.finite(lag_online_mean_days))|>mutate(submission_old=lag_submission_mean_days>=365,online_old=lag_online_mean_days>=365,transition=case_when(!submission_old&!online_old~"Current at both milestones",!submission_old&online_old~"Crossed one-year threshold during publication",submission_old&online_old~"Already at least one year old at submission",submission_old&!online_old~"Returned below one year",TRUE~"Other"))
+plot_dat<-d|>count(submission_old,online_old,transition)|>mutate(percent=100*n/sum(n),x=1,xend=2,y=ifelse(submission_old,1,0),yend=ifelse(online_old,1,0),transition=factor(transition,levels=c("Current at both milestones","Crossed one-year threshold during publication","Already at least one year old at submission","Returned below one year")))|>filter(n>0)
+tab<-table(factor(d$submission_old,levels=c(FALSE,TRUE)),factor(d$online_old,levels=c(FALSE,TRUE)));mc<-mcnemar.test(tab,correct=TRUE)
+write_tsv(d,file.path(script_dir,"fig 1g analysis data used.txt"));write_tsv(as.data.frame.matrix(tab),file.path(script_dir,"fig 1g paired threshold table.txt"));writeLines(c("Paired McNemar test",paste0("Chi-square=",unname(mc$statistic)),paste0("df=",unname(mc$parameter)),paste0("P=",mc$p.value)),file.path(script_dir,"fig 1g statistical results.txt"))
+nodes<-bind_rows(
+  d|>count(state=submission_old)|>mutate(x=1,stage="Submission"),
+  d|>count(state=online_old)|>mutate(x=2,stage="Online publication"))|>
+  mutate(y=ifelse(state,1,0),state_label=ifelse(state,"At least one year old","Less than one year old"),
+         label=paste0(ifelse(state,"At least one year old","Less than one year old"),"\n",n," articles (",sprintf("%.1f",100*n/nrow(d)),"%)"),
+         label_x=ifelse(x==1,.77,2.23),label_hjust=ifelse(x==1,1,0))
+flow_labels<-plot_dat|>mutate(
+  label_x=case_when(
+    transition=="Current at both milestones"~.76,
+    transition=="Crossed one-year threshold during publication"~1.50,
+    transition=="Already at least one year old at submission"~2.24,
+    TRUE~1.50),
+  label_y=-.34,
+  short_label=case_when(
+    transition=="Current at both milestones"~"Current at both",
+    transition=="Crossed one-year threshold during publication"~"Crossed threshold",
+    transition=="Already at least one year old at submission"~"Already >=1 year",
+    TRUE~"Other"),
+  label=paste0(short_label,"\n",n," articles (",sprintf("%.1f",percent),"%)"))
+p<-ggplot(plot_dat)+
+  geom_curve(aes(x=x,y=y,xend=xend,yend=yend,linewidth=n,colour=transition),curvature=.22,alpha=.58,lineend="round")+
+  geom_point(data=nodes,aes(x=x,y=y,size=n,fill=state),shape=21,colour="white",stroke=1.1,inherit.aes=FALSE)+
+  geom_label(data=nodes,aes(x=label_x,y=y,label=label,hjust=label_hjust),family=font_family,fontface="bold",size=2.9,
+             linewidth=.25,fill="white",lineheight=.95,inherit.aes=FALSE)+
+  geom_label(data=flow_labels,aes(x=label_x,y=label_y,label=label,colour=transition),family=font_family,size=2.8,
+             linewidth=.22,fill="white",fontface="bold",show.legend=FALSE,inherit.aes=FALSE)+
+  annotate("text",x=c(1,2),y=1.30,label=c("Submission","Online publication"),family=font_family,fontface="bold",size=4.0)+
+  scale_colour_manual(values=c("Current at both milestones"=pal[8],"Crossed one-year threshold during publication"=pal[5],"Already at least one year old at submission"=pal[1],"Returned below one year"=pal[7]))+
+  scale_fill_manual(values=c("FALSE"=pal[8],"TRUE"=pal[1]),guide="none")+
+  scale_linewidth(range=c(2.5,11),guide="none")+scale_size(range=c(9,17),guide="none")+
+  coord_cartesian(xlim=c(.35,2.65),ylim=c(-.49,1.40),clip="off")+
+  labs(title="Acquisition of one-year model staleness during publication",
+       subtitle="Flow width represents the number of articles moving between age states",
+       x=NULL,y=NULL,colour=NULL,caption=paste0("Flow labels show n (%). Paired McNemar test: ",fmt_p(mc$p.value),"; complete submission-online pairs: n = ",nrow(d),"."))+
+  theme_void(base_family=font_family)+theme(plot.title=element_text(face="bold",size=14,colour="#222222"),
+    plot.subtitle=element_text(size=12,colour="#555555",margin=margin(b=10)),plot.caption=element_text(size=10,colour="#555555",hjust=0,margin=margin(t=8)),
+    legend.position="none",plot.margin=margin(12,18,12,18))
+save_figure(p,"Figure 1 G One-year staleness acquired during publication",9.4,6.0)
