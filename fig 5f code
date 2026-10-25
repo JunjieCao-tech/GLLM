@@ -1,0 +1,77 @@
+# ============================================================
+# LLM obsolescence study: reproducible figure script
+# Inputs: main_article.txt and main_model.txt in the package root
+# Outputs: analysis data, statistical results, 600 dpi PNG and vector PDF
+# ============================================================
+required_packages <- c("ggplot2","dplyr","tidyr","forcats","scales","sandwich","lmtest")
+missing_packages <- required_packages[!vapply(required_packages,requireNamespace,logical(1),quietly=TRUE)]
+if(length(missing_packages)>0) install.packages(missing_packages,repos="https://cloud.r-project.org",dependencies=TRUE)
+suppressPackageStartupMessages({library(ggplot2);library(dplyr);library(tidyr);library(forcats);library(scales)})
+get_script_dir <- function(){
+  override<-Sys.getenv("LLM_LAG_SCRIPT_DIR",unset="")
+  if(nzchar(override))return(normalizePath(override,mustWork=TRUE))
+  args<-commandArgs(trailingOnly=FALSE); f<-grep("^--file=",args,value=TRUE)
+  if(length(f)>0)return(dirname(normalizePath(sub("^--file=","",f[1]))))
+  if(requireNamespace("rstudioapi",quietly=TRUE)&&rstudioapi::isAvailable()){
+    p<-rstudioapi::getActiveDocumentContext()$path;if(nzchar(p))return(dirname(normalizePath(p)))
+  }
+  normalizePath(getwd())
+}
+script_dir<-get_script_dir(); project_dir<-normalizePath(file.path(script_dir,".."),mustWork=FALSE)
+read_tsv_safe<-function(path){
+  if(!file.exists(path))stop("Missing input: ",path)
+  for(enc in c("UTF-8","UTF-8-BOM","GB18030","GBK")){
+    lines<-tryCatch(readLines(path,encoding=enc,warn=FALSE),error=function(e)NULL)
+    if(is.null(lines)||length(lines)<2)next
+    x<-tryCatch(read.delim(textConnection(lines),sep="\t",header=TRUE,quote="\"",fill=TRUE,comment.char="",stringsAsFactors=FALSE,check.names=FALSE,na.strings=c("","NA","N/A")),error=function(e)NULL)
+    if(!is.null(x)&&nrow(x)>1)return(x)
+  }
+  stop("Cannot read: ",path)
+}
+article_dat<-read_tsv_safe(file.path(project_dir,"main_article.txt"))|>mutate(
+  article_no=as.numeric(article_no),publication_year=as.numeric(publication_year),model_count=as.numeric(model_count),mapped_model_count=as.numeric(mapped_model_count),mapping_coverage=as.numeric(mapping_coverage),
+  across(c(lag_submission_mean_days,lag_acceptance_mean_days,lag_online_mean_days,review_delay_days,production_delay_days,total_editorial_delay_days),as.numeric),
+  submission_date=as.Date(submission_date),acceptance_date=as.Date(acceptance_date),online_date=as.Date(online_date),
+  any_nonpositive_submission=tolower(as.character(any_nonpositive_submission))%in%c("true","1"),has_lamda=tolower(as.character(has_lamda))%in%c("true","1"))
+model_dat<-read_tsv_safe(file.path(project_dir,"main_model.txt"))|>mutate(
+  article_no=as.numeric(article_no),table2_row=as.numeric(table2_row),publication_year=as.numeric(publication_year),primary_eligible=as.numeric(primary_eligible),
+  model_release_date=as.Date(model_release_date),submission_date=as.Date(submission_date),acceptance_date=as.Date(acceptance_date),online_date=as.Date(online_date),
+  across(c(lag_submission_days,lag_acceptance_days,lag_online_days),as.numeric))
+write_tsv<-function(x,path)write.table(x,path,sep="\t",row.names=FALSE,col.names=TRUE,quote=FALSE,fileEncoding="UTF-8")
+desc_stats<-function(x){x<-x[is.finite(x)];if(!length(x))return(data.frame(n=0,mean=NA,sd=NA,median=NA,q1=NA,q3=NA,min=NA,max=NA));data.frame(n=length(x),mean=mean(x),sd=if(length(x)>1)sd(x)else 0,median=median(x),q1=unname(quantile(x,.25)),q3=unname(quantile(x,.75)),min=min(x),max=max(x))}
+mean_or_na<-function(x)if(all(is.na(x)))NA_real_ else mean(x,na.rm=TRUE)
+fmt_p<-function(p)ifelse(is.na(p),"P unavailable",ifelse(p<.001,"P < 0.001",paste0("P = ",sprintf("%.3f",p))))
+pal<-c("#6F4C9F","#D56C9C","#7B8CCB","#B68ACD","#F59B5E","#F6D55C","#9E9E9E","#338333")
+font_family<-"Arial"
+theme_journal<-function(base_size=12)theme_classic(base_size=base_size,base_family=font_family)+theme(text=element_text(colour="#222222"),plot.title=element_text(face="bold",size=base_size+2),plot.subtitle=element_text(colour="#555555",margin=margin(b=8)),plot.caption=element_text(colour="#555555",size=base_size-2,hjust=0,margin=margin(t=8)),axis.title=element_text(face="bold"),legend.title=element_text(face="bold"),legend.position="top",panel.grid.major.y=element_line(colour="#E6E6E6",linewidth=.3),panel.grid.minor=element_blank(),plot.margin=margin(10,14,10,10))
+save_figure<-function(p,stem,width,height){
+  if(!is.null(p$labels$subtitle)&&is.character(p$labels$subtitle))p<-p+labs(subtitle=paste(strwrap(p$labels$subtitle,width=78),collapse="\n"))
+  if(!is.null(p$labels$caption)&&is.character(p$labels$caption))p<-p+labs(caption=paste(strwrap(p$labels$caption,width=105),collapse="\n"))
+  p<-p+theme(plot.caption.position="plot",plot.caption=element_text(lineheight=.95))
+  saveRDS(p,file.path(script_dir,paste0(stem,".plot.rds")))
+  ggsave(file.path(script_dir,paste0(stem,".pdf")),p,device=grDevices::cairo_pdf,width=width,height=height,units="in",bg="white")
+  ggsave(file.path(script_dir,paste0(stem,".png")),p,device="png",dpi=600,width=width,height=height,units="in",bg="white")
+}
+
+make_paired<-function(d,definition){d|>filter(primary_eligible==1,!is.na(class),is.finite(lag_submission_days))|>distinct(article_no,table2_row,.keep_all=TRUE)|>group_by(article_no,class)|>summarise(lag=mean(lag_submission_days),.groups="drop")|>pivot_wider(names_from=class,values_from=lag)|>filter(is.finite(`Open model`),is.finite(`Closed model`))|>transmute(article_no,definition=definition,open_lag=`Open model`,closed_lag=`Closed model`,difference_closed_minus_open=`Closed model`-`Open model`)}
+broad<-model_dat|>mutate(class=case_when(model_access=="Open/open-weight"~"Open model",model_access=="Closed/proprietary"~"Closed model",TRUE~NA_character_))
+strict<-model_dat|>mutate(class=case_when(strict_license_class=="Open-source license confirmed"~"Open model",strict_license_class=="Closed/proprietary"~"Closed model",TRUE~NA_character_))
+paired<-bind_rows(make_paired(broad,"Open/open-weight definition"),make_paired(strict,"Confirmed open-source license"));set.seed(20261017)
+tests<-paired|>group_by(definition)|>group_modify(~{x<-.x$difference_closed_minus_open;boot<-replicate(10000,median(sample(x,replace=TRUE)));w<-wilcox.test(.x$closed_lag,.x$open_lag,paired=TRUE,exact=FALSE);data.frame(n=length(x),median_difference=median(x),ci_low=quantile(boot,.025),ci_high=quantile(boot,.975),V=unname(w$statistic),p_value=w$p.value)})|>ungroup()
+write_tsv(paired,file.path(script_dir,"fig 4f analysis data used.txt"));write_tsv(tests,file.path(script_dir,"fig 4f statistical results.txt"))
+paired<-paired|>mutate(definition=factor(definition,levels=c("Confirmed open-source license","Open/open-weight definition")))
+visible_range<-quantile(paired$difference_closed_minus_open,c(.02,.98),na.rm=TRUE);label_x<-visible_range[2]+.06*diff(visible_range)
+tests<-tests|>mutate(definition=factor(definition,levels=levels(paired$definition)),label=paste0("Median ",round(median_difference)," d; n=",n,"; ",fmt_p(p_value)),label_x=label_x)
+label_dat<-tests|>mutate(x=median_difference)
+p<-ggplot(paired,aes(difference_closed_minus_open,definition,fill=definition))+
+  geom_vline(xintercept=0,linetype=2,colour=pal[7])+
+  geom_violin(orientation="y",scale="width",trim=FALSE,alpha=.28,colour=NA)+
+  geom_jitter(aes(colour=definition),height=.075,width=0,size=1.5,alpha=.28,show.legend=FALSE)+
+  geom_boxplot(orientation="y",width=.13,outlier.shape=NA,alpha=.58,colour="#333333",show.legend=FALSE)+
+  geom_text(data=label_dat,aes(x=label_x,y=definition,label=label,colour=definition),inherit.aes=FALSE,hjust=0,family=font_family,fontface="bold",size=2.7,show.legend=FALSE)+
+  scale_fill_manual(values=c("Confirmed open-source license"=pal[6],"Open/open-weight definition"=pal[4]),guide="none")+
+  scale_colour_manual(values=c("Confirmed open-source license"=pal[5],"Open/open-weight definition"=pal[1]),guide="none")+
+  scale_x_continuous(expand=expansion(mult=c(.04,.18)))+
+  labs(title="Sensitivity to the definition of open-source models",subtitle="Raincloud-style distributions of within-article differences; closed minus open",x="Closed minus open submission lag (days)",y=NULL,caption="Positive values indicate longer lag for closed models. Paired samples are identical to Figure 3H: broad definition n=207; confirmed-license definition n=89. Bootstrap 95% CIs are retained in the statistical-results file.")+
+  theme_journal()+theme(panel.grid.major.y=element_blank(),legend.position="none")
+save_figure(p,"Figure 4 F Sensitivity to open-source definition",10.0,5.4)
