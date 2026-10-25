@@ -1,0 +1,47 @@
+# ============================================================
+# Sensitivity to incomplete journal date reporting
+# Lancet Digital Health records are identified by DOI prefix.
+# Inputs: main_article.txt; main_model.txt is not required for this article-level sensitivity analysis.
+# ============================================================
+required_packages<-c("ggplot2","dplyr","tidyr","scales")
+missing_packages<-required_packages[!vapply(required_packages,requireNamespace,logical(1),quietly=TRUE)]
+if(length(missing_packages)>0)install.packages(missing_packages,repos="https://cloud.r-project.org",dependencies=TRUE)
+suppressPackageStartupMessages({library(ggplot2);library(dplyr);library(tidyr);library(scales)})
+get_script_dir<-function(){override<-Sys.getenv("LLM_LAG_SCRIPT_DIR",unset="");if(nzchar(override))return(normalizePath(override,mustWork=TRUE));args<-commandArgs(trailingOnly=FALSE);f<-grep("^--file=",args,value=TRUE);if(length(f))return(dirname(normalizePath(sub("^--file=","",f[1]))));normalizePath(getwd())}
+script_dir<-get_script_dir();project_dir<-normalizePath(file.path(script_dir,".."),mustWork=FALSE)
+read_tsv_safe<-function(path){if(!file.exists(path))stop("Missing input: ",path);for(enc in c("UTF-8","UTF-8-BOM","GB18030","GBK")){lines<-tryCatch(readLines(path,encoding=enc,warn=FALSE),error=function(e)NULL);if(is.null(lines)||length(lines)<2)next;x<-tryCatch(read.delim(textConnection(lines),sep="\t",header=TRUE,quote="\"",fill=TRUE,comment.char="",stringsAsFactors=FALSE,check.names=FALSE,na.strings=c("","NA","N/A")),error=function(e)NULL);if(!is.null(x)&&nrow(x)>0)return(x)};stop("Cannot read: ",path)}
+write_tsv<-function(x,path)write.table(x,path,sep="\t",row.names=FALSE,col.names=TRUE,quote=FALSE,fileEncoding="UTF-8")
+fmt_p<-function(p)ifelse(p<.001,"P < 0.001",paste0("P = ",sprintf("%.3f",p)))
+pal<-c("#6F4C9F","#D56C9C","#7B8CCB","#B68ACD","#F59B5E","#F6D55C","#9E9E9E","#338333")
+font_family<-"Arial"
+theme_journal<-function(base_size=12)theme_classic(base_size=base_size,base_family=font_family)+theme(text=element_text(colour="#222222"),plot.title=element_text(face="bold",size=base_size+2),plot.subtitle=element_text(colour="#555555",margin=margin(b=8)),plot.caption=element_text(colour="#555555",size=base_size-2,hjust=0,margin=margin(t=8)),axis.title=element_text(face="bold"),panel.grid.major.y=element_line(colour="#E6E6E6",linewidth=.3),panel.grid.minor=element_blank(),plot.margin=margin(10,16,10,10))
+save_figure<-function(p,stem,width,height){if(!is.null(p$labels$subtitle))p<-p+labs(subtitle=paste(strwrap(p$labels$subtitle,width=78),collapse="\n"));if(!is.null(p$labels$caption))p<-p+labs(caption=paste(strwrap(p$labels$caption,width=110),collapse="\n"));saveRDS(p,file.path(script_dir,paste0(stem,".plot.rds")));ggsave(file.path(script_dir,paste0(stem,".pdf")),p,device=grDevices::cairo_pdf,width=width,height=height,units="in",bg="white");ggsave(file.path(script_dir,paste0(stem,".png")),p,device="png",dpi=600,width=width,height=height,units="in",bg="white")}
+
+d<-read_tsv_safe(file.path(project_dir,"main_article.txt"))|>mutate(article_no=as.numeric(article_no),publication_year=as.numeric(publication_year),online_date=as.Date(online_date),lag_online_mean_days=as.numeric(lag_online_mean_days),submission_date=as.Date(submission_date),acceptance_date=as.Date(acceptance_date),is_ldh=grepl("^10\\.1016/(S2589-7500|j\\.landig)",doi,ignore.case=TRUE),ldh_online_only=is_ldh&is.na(submission_date)&is.na(acceptance_date)&!is.na(online_date))
+ldh_audit<-d|>filter(ldh_online_only)|>select(article_no,doi,title,submission_date,acceptance_date,online_date,ldh_online_only)
+if(sum(d$ldh_online_only,na.rm=TRUE)!=9)stop("Unexpected count; expected 9 Lancet Digital Health records with online dates only")
+base<-d|>filter(is.finite(lag_online_mean_days),!is.na(online_date))
+sets<-list("All eligible online-lag records"=base,"Exclude 9 online-only LDH records"=base|>filter(!ldh_online_only))
+set.seed(20261017);B<-10000
+rows<-lapply(names(sets),function(nm){z<-sets[[nm]];x<-z$lag_online_mean_days;boot<-replicate(B,{v<-sample(x,length(x),replace=TRUE);c(mean=mean(v),median=median(v))});ct<-cor.test(as.numeric(z$online_date),x,method="spearman",exact=FALSE);data.frame(scope=nm,n=length(x),mean=mean(x),mean_ci_low=quantile(boot["mean",],.025),mean_ci_high=quantile(boot["mean",],.975),median=median(x),median_ci_low=quantile(boot["median",],.025),median_ci_high=quantile(boot["median",],.975),date_trend_rho=unname(ct$estimate),date_trend_p=ct$p.value)})
+stats<-bind_rows(rows);write_tsv(ldh_audit,file.path(script_dir,"fig 4i Lancet Digital Health article audit.txt"));write_tsv(stats,file.path(script_dir,"fig 4i statistical results.txt"));write_tsv(base,file.path(script_dir,"fig 4i analysis data used.txt"))
+probs<-seq(.05,.95,.05)
+qdat<-bind_rows(lapply(names(sets),function(nm){x<-sets[[nm]]$lag_online_mean_days;data.frame(scope=nm,percentile=probs,lag=as.numeric(quantile(x,probs,na.rm=TRUE)))}))
+delta_dat<-qdat|>select(scope,percentile,lag)|>tidyr::pivot_wider(names_from=scope,values_from=lag)|>
+  transmute(percentile,delta=`Exclude 9 online-only LDH records`-`All eligible online-lag records`,direction=if_else(delta>=0,"Higher after exclusion","Lower after exclusion"))
+write_tsv(delta_dat,file.path(script_dir,"fig 4i quantile differences.txt"))
+median_delta<-delta_dat|>filter(abs(percentile-.5)<1e-9)|>mutate(label=paste0("Median change ",if_else(delta>0,"+",""),sprintf("%.1f",delta)," days"))
+p<-ggplot(delta_dat,aes(percentile,delta))+
+  geom_hline(yintercept=0,colour="#707070",linewidth=.55)+
+  geom_segment(aes(xend=percentile,y=0,yend=delta,colour=direction),linewidth=.9,alpha=.55)+
+  geom_line(colour=pal[1],linewidth=1.1)+
+  geom_point(aes(fill=direction),shape=21,size=3.2,colour="white",stroke=.65)+
+  geom_point(data=median_delta,shape=21,size=6,fill=pal[6],colour=pal[1],stroke=1.15)+
+  geom_label(data=median_delta,aes(label=label),nudge_x=.055,nudge_y=1.3,hjust=0,fill=scales::alpha("white",.9),colour=pal[1],label.size=0,family=font_family,fontface="bold",size=3.05)+
+  scale_colour_manual(values=c("Higher after exclusion"=pal[5],"Lower after exclusion"=pal[3]),guide="none")+
+  scale_fill_manual(values=c("Higher after exclusion"=pal[5],"Lower after exclusion"=pal[3]),name=NULL)+
+  scale_x_continuous(labels=function(x)paste0(round(100*x),"th"),breaks=c(.05,.25,.5,.75,.95),limits=c(.035,.97),expand=expansion(mult=c(.01,.03)))+
+  scale_y_continuous(labels=function(x)paste0(ifelse(x>0,"+",""),sprintf("%.0f",x)),expand=expansion(mult=c(.18,.28)))+
+  labs(title="Sensitivity to incomplete journal date reporting",subtitle="Change in each online-publication-lag quantile after excluding 9 date-incomplete Lancet Digital Health records",x="Distribution percentile",y="Change after exclusion (days)",caption="Difference = exclusion analysis minus full analysis. Values close to zero indicate little influence of the nine online-only records; positive values indicate a longer lag after exclusion.")+
+  theme_journal()+theme(legend.position="top",panel.grid.major.x=element_blank(),legend.key.width=grid::unit(1.1,"lines"))
+save_figure(p,"Figure 4 I Sensitivity to incomplete journal date reporting",10.8,5.8)
