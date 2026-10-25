@@ -1,0 +1,71 @@
+# ============================================================
+# LLM obsolescence study: reproducible figure script
+# Inputs: main_article.txt and main_model.txt in the package root
+# Outputs: analysis data, statistical results, 600 dpi PNG and vector PDF
+# ============================================================
+required_packages <- c("ggplot2","dplyr","tidyr","forcats","scales","sandwich","lmtest")
+missing_packages <- required_packages[!vapply(required_packages,requireNamespace,logical(1),quietly=TRUE)]
+if(length(missing_packages)>0) install.packages(missing_packages,repos="https://cloud.r-project.org",dependencies=TRUE)
+suppressPackageStartupMessages({library(ggplot2);library(dplyr);library(tidyr);library(forcats);library(scales)})
+get_script_dir <- function(){
+  override<-Sys.getenv("LLM_LAG_SCRIPT_DIR",unset="")
+  if(nzchar(override))return(normalizePath(override,mustWork=TRUE))
+  args<-commandArgs(trailingOnly=FALSE); f<-grep("^--file=",args,value=TRUE)
+  if(length(f)>0)return(dirname(normalizePath(sub("^--file=","",f[1]))))
+  if(requireNamespace("rstudioapi",quietly=TRUE)&&rstudioapi::isAvailable()){
+    p<-rstudioapi::getActiveDocumentContext()$path;if(nzchar(p))return(dirname(normalizePath(p)))
+  }
+  normalizePath(getwd())
+}
+script_dir<-get_script_dir(); project_dir<-normalizePath(file.path(script_dir,".."),mustWork=FALSE)
+read_tsv_safe<-function(path){
+  if(!file.exists(path))stop("Missing input: ",path)
+  for(enc in c("UTF-8","UTF-8-BOM","GB18030","GBK")){
+    lines<-tryCatch(readLines(path,encoding=enc,warn=FALSE),error=function(e)NULL)
+    if(is.null(lines)||length(lines)<2)next
+    x<-tryCatch(read.delim(textConnection(lines),sep="\t",header=TRUE,quote="\"",fill=TRUE,comment.char="",stringsAsFactors=FALSE,check.names=FALSE,na.strings=c("","NA","N/A")),error=function(e)NULL)
+    if(!is.null(x)&&nrow(x)>1)return(x)
+  }
+  stop("Cannot read: ",path)
+}
+article_dat<-read_tsv_safe(file.path(project_dir,"main_article.txt"))|>mutate(
+  article_no=as.numeric(article_no),publication_year=as.numeric(publication_year),model_count=as.numeric(model_count),mapped_model_count=as.numeric(mapped_model_count),mapping_coverage=as.numeric(mapping_coverage),
+  across(c(lag_submission_mean_days,lag_acceptance_mean_days,lag_online_mean_days,review_delay_days,production_delay_days,total_editorial_delay_days),as.numeric),
+  submission_date=as.Date(submission_date),acceptance_date=as.Date(acceptance_date),online_date=as.Date(online_date),
+  any_nonpositive_submission=tolower(as.character(any_nonpositive_submission))%in%c("true","1"),has_lamda=tolower(as.character(has_lamda))%in%c("true","1"))
+model_dat<-read_tsv_safe(file.path(project_dir,"main_model.txt"))|>mutate(
+  article_no=as.numeric(article_no),table2_row=as.numeric(table2_row),publication_year=as.numeric(publication_year),primary_eligible=as.numeric(primary_eligible),
+  model_release_date=as.Date(model_release_date),submission_date=as.Date(submission_date),acceptance_date=as.Date(acceptance_date),online_date=as.Date(online_date),
+  across(c(lag_submission_days,lag_acceptance_days,lag_online_days),as.numeric))
+write_tsv<-function(x,path)write.table(x,path,sep="\t",row.names=FALSE,col.names=TRUE,quote=FALSE,fileEncoding="UTF-8")
+desc_stats<-function(x){x<-x[is.finite(x)];if(!length(x))return(data.frame(n=0,mean=NA,sd=NA,median=NA,q1=NA,q3=NA,min=NA,max=NA));data.frame(n=length(x),mean=mean(x),sd=if(length(x)>1)sd(x)else 0,median=median(x),q1=unname(quantile(x,.25)),q3=unname(quantile(x,.75)),min=min(x),max=max(x))}
+mean_or_na<-function(x)if(all(is.na(x)))NA_real_ else mean(x,na.rm=TRUE)
+fmt_p<-function(p)ifelse(is.na(p),"P unavailable",ifelse(p<.001,"P < 0.001",paste0("P = ",sprintf("%.3f",p))))
+pal<-c("#6F4C9F","#D56C9C","#7B8CCB","#B68ACD","#F59B5E","#F6D55C","#9E9E9E","#338333")
+font_family<-"Arial"
+theme_journal<-function(base_size=12)theme_classic(base_size=base_size,base_family=font_family)+theme(text=element_text(colour="#222222"),plot.title=element_text(face="bold",size=base_size+2),plot.subtitle=element_text(colour="#555555",margin=margin(b=8)),plot.caption=element_text(colour="#555555",size=base_size-2,hjust=0,margin=margin(t=8)),axis.title=element_text(face="bold"),legend.title=element_text(face="bold"),legend.position="top",panel.grid.major.y=element_line(colour="#E6E6E6",linewidth=.3),panel.grid.minor=element_blank(),plot.margin=margin(10,14,10,10))
+save_figure<-function(p,stem,width,height){
+  if(!is.null(p$labels$subtitle)&&is.character(p$labels$subtitle))p<-p+labs(subtitle=paste(strwrap(p$labels$subtitle,width=78),collapse="\n"))
+  if(!is.null(p$labels$caption)&&is.character(p$labels$caption))p<-p+labs(caption=paste(strwrap(p$labels$caption,width=105),collapse="\n"))
+  p<-p+theme(plot.caption.position="plot",plot.caption=element_text(lineheight=.95))
+  saveRDS(p,file.path(script_dir,paste0(stem,".plot.rds")))
+  ggsave(file.path(script_dir,paste0(stem,".pdf")),p,device=grDevices::cairo_pdf,width=width,height=height,units="in",bg="white")
+  ggsave(file.path(script_dir,paste0(stem,".png")),p,device="png",dpi=600,width=width,height=height,units="in",bg="white")
+}
+
+x<-article_dat$lag_submission_mean_days;x<-x[is.finite(x)];cuts<-quantile(x,c(.01,.99),names=FALSE);sets<-list("Complete data"=x,"Exclude values below 1st or above 99th percentile"=x[x>=cuts[1]&x<=cuts[2]])
+set.seed(20261017);rows<-list();k<-1
+for(nm in names(sets)){z<-sets[[nm]];bm<-replicate(10000,mean(sample(z,replace=TRUE)));bmed<-replicate(10000,median(sample(z,replace=TRUE)));rows[[k]]<-data.frame(strategy=nm,estimate_type="Mean",n=length(z),estimate=mean(z),ci_low=quantile(bm,.025),ci_high=quantile(bm,.975));k<-k+1;rows[[k]]<-data.frame(strategy=nm,estimate_type="Median",n=length(z),estimate=median(z),ci_low=quantile(bmed,.025),ci_high=quantile(bmed,.975));k<-k+1}
+plot_dat<-bind_rows(rows);write_tsv(plot_dat,file.path(script_dir,"fig 4g analysis data used.txt"));writeLines(c(paste0("1st percentile=",cuts[1]),paste0("99th percentile=",cuts[2]),"Bootstrap resamples=3000"),file.path(script_dir,"fig 4g statistical results.txt"))
+plot_dat<-plot_dat|>mutate(strategy=factor(strategy,levels=c("Complete data","Exclude values below 1st or above 99th percentile")),label=paste0(round(estimate)," d\nn=",n))
+p<-ggplot(plot_dat,aes(strategy,estimate,group=estimate_type,colour=estimate_type))+
+  geom_line(linewidth=1.05)+
+  geom_linerange(aes(ymin=ci_low,ymax=ci_high),linewidth=.75,alpha=.65)+
+  geom_point(aes(shape=estimate_type),size=4.2,fill="white",stroke=1.1)+
+  geom_text(aes(label=label,vjust=ifelse(estimate_type=="Mean",-1.1,1.35)),family=font_family,size=2.7,show.legend=FALSE)+
+  scale_colour_manual(values=pal[c(1,5)])+
+  scale_x_discrete(labels=c("Complete data"="Complete data","Exclude values below 1st or above 99th percentile"="Trim lower and upper 1%"))+
+  scale_y_continuous(expand=expansion(mult=c(.16,.18)))+
+  labs(title="Sensitivity to extreme submission-lag values",subtitle="Slope chart shows how mean and median change after trimming the two tails",x=NULL,y="Submission lag (days)",colour="Estimate",shape="Estimate",caption=paste0("Cut points: ",round(cuts[1],1)," and ",round(cuts[2],1)," days; vertical whiskers are nonparametric bootstrap 95% CIs."))+
+  theme_journal()+theme(panel.grid.major.x=element_blank(),legend.position="top")
+save_figure(p,"Figure 4 G Sensitivity to extreme submission-lag values",10.0,5.6)
