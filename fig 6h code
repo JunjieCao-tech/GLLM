@@ -1,0 +1,58 @@
+required_packages<-c("ggplot2","dplyr","tidyr","scales")
+missing_packages<-required_packages[!vapply(required_packages,requireNamespace,logical(1),quietly=TRUE)]
+if(length(missing_packages)>0)install.packages(missing_packages,repos="https://cloud.r-project.org",dependencies=TRUE)
+suppressPackageStartupMessages({library(ggplot2);library(dplyr);library(tidyr);library(scales)})
+get_script_dir<-function(){
+ override<-Sys.getenv("LLM_LAG_SCRIPT_DIR",unset="")
+ if(nzchar(override))return(normalizePath(override,mustWork=TRUE))
+ args<-commandArgs(trailingOnly=FALSE);f<-grep("^--file=",args,value=TRUE)
+ if(length(f))return(dirname(normalizePath(sub("^--file=","",f[1]))))
+ if(requireNamespace("rstudioapi",quietly=TRUE)&&rstudioapi::isAvailable()){p<-rstudioapi::getActiveDocumentContext()$path;if(nzchar(p))return(dirname(normalizePath(p)))}
+ normalizePath(getwd())
+}
+script_dir<-get_script_dir();project_dir<-normalizePath(file.path(script_dir,".."),mustWork=TRUE)
+read_tsv<-function(p){
+ if(!file.exists(p))stop("Missing input: ",p)
+ for(enc in c("UTF-8","UTF-8-BOM","GB18030","GBK")){
+  lines<-tryCatch(readLines(p,encoding=enc,warn=FALSE),error=function(e)NULL)
+  if(is.null(lines)||length(lines)<2)next
+  x<-tryCatch(read.delim(textConnection(lines),sep="\t",header=TRUE,quote="",fill=TRUE,comment.char="",stringsAsFactors=FALSE,check.names=FALSE,na.strings=c("","NA","N/A")),error=function(e)NULL)
+  if(!is.null(x)&&nrow(x)>0)return(x)
+ }
+ stop("Cannot read: ",p)
+}
+article<-read_tsv(file.path(project_dir,"figure5_article_data.txt"))
+pre<-article|>filter(preprint_status=="Yes")
+num<-function(x)suppressWarnings(as.numeric(x))
+article<-article|>mutate(publication_year=num(publication_year),lag_online_mean_days=num(lag_online_mean_days))
+pre<-pre|>mutate(publication_year=num(publication_year),across(c(preprint_to_submission_days,preprint_to_acceptance_days,preprint_to_online_days,preprint_strict_gllm_count,final_strict_gllm_count,preprint_final_jaccard,preprint_models_retained,final_models_added,preprint_models_removed,model_turnover_count,review_delay_days,production_delay_days),num))
+pal<-c("#6F4C9F","#D56C9C","#7B8CCB","#B68ACD","#F59B5E","#F6D55C","#9E9E9E","#338333")
+font_family<-"Arial"
+theme_journal<-function(base_size=13)theme_classic(base_size=base_size,base_family=font_family)+theme(
+ text=element_text(colour="#222222"),plot.title=element_text(face="bold",size=base_size+2),
+ plot.subtitle=element_text(colour="#555555",margin=margin(b=9)),plot.caption=element_text(colour="#555555",size=base_size-2,hjust=0,margin=margin(t=9)),
+ axis.title=element_text(face="bold"),legend.title=element_text(face="bold"),legend.position="top",
+ panel.grid.major.y=element_line(colour="#E8E8E8",linewidth=.35),panel.grid.minor=element_blank(),
+ plot.margin=margin(12,18,12,12))
+fmt_p<-function(p)ifelse(is.na(p),"P unavailable",ifelse(p<.001,"P < 0.001",paste0("P = ",formatC(p,format="f",digits=3))))
+write_tsv<-function(x,p)write.table(x,p,sep="\t",row.names=FALSE,col.names=TRUE,quote=FALSE,fileEncoding="UTF-8")
+save_panel<-function(p,stem,w=10.5,h=7.2){
+ saveRDS(p,file.path(script_dir,paste0(stem,".plot.rds")))
+ ggsave(file.path(script_dir,paste0(stem,".pdf")),p,device=grDevices::cairo_pdf,width=w,height=h,units="in",bg="white")
+ ggsave(file.path(script_dir,paste0(stem,".png")),p,device="png",dpi=600,width=w,height=h,units="in",bg="white")
+}
+
+d<-pre|>filter(is.finite(preprint_to_submission_days),is.finite(model_turnover_count))
+rho<-cor.test(d$preprint_to_submission_days,d$model_turnover_count,method="spearman",exact=FALSE)
+p<-ggplot(d,aes(preprint_to_submission_days,model_turnover_count))+geom_hline(yintercept=0,colour="#E7E7E7")+
+ geom_vline(xintercept=0,linetype=2,colour=pal[7])+geom_point(aes(fill=preprint_stage,size=final_strict_gllm_count),shape=21,alpha=.74,colour="white",stroke=.35)+
+ geom_smooth(method="loess",se=TRUE,span=.9,colour=pal[1],fill=pal[4],alpha=.22,linewidth=1.1)+
+ scale_fill_manual(values=c("Before submission"=pal[1],"During peer review"=pal[2],"During production"=pal[5]),name="Posting stage")+
+ scale_size_continuous(range=c(2.5,8),breaks=c(0,10,20),name="Final model count")+
+ labs(title="Preprint lead time and model-set turnover",subtitle="Each point is one article; the curve is a descriptive LOESS fit",
+ x="Lead time to submission (days; negative = posted after submission)",y="Models added or removed",
+ caption=paste0("Spearman rho = ",sprintf("%.2f",unname(rho$estimate)),", ",fmt_p(rho$p.value),"; n = ",nrow(d),". Association is descriptive and does not imply causation."))+
+ theme_journal()+guides(fill=guide_legend(order=1,nrow=1),size=guide_legend(order=2,nrow=1,override.aes=list(shape=21,fill=pal[4],colour="#333333",alpha=1,stroke=.6)))+
+ theme(legend.box="vertical",legend.box.just="left",legend.justification="left",legend.spacing.y=unit(1,"pt"),plot.margin=margin(12,34,14,14))
+write_tsv(d,file.path(script_dir,"fig 5h analysis data used.txt"));writeLines(capture.output(rho),file.path(script_dir,"fig 5h statistical results.txt"))
+save_panel(p,"Figure 5 H Preprint lead time and model turnover",11.5,8.2)
