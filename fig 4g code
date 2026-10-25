@@ -1,0 +1,91 @@
+# ============================================================
+# LLM obsolescence study: reproducible figure script
+# Inputs: main_article.txt and main_model.txt in the package root
+# Outputs: analysis data, statistical results, 600 dpi PNG and vector PDF
+# ============================================================
+required_packages <- c("ggplot2","dplyr","tidyr","forcats","scales","sandwich","lmtest")
+missing_packages <- required_packages[!vapply(required_packages,requireNamespace,logical(1),quietly=TRUE)]
+if(length(missing_packages)>0) install.packages(missing_packages,repos="https://cloud.r-project.org",dependencies=TRUE)
+suppressPackageStartupMessages({library(ggplot2);library(dplyr);library(tidyr);library(forcats);library(scales)})
+get_script_dir <- function(){
+  override<-Sys.getenv("LLM_LAG_SCRIPT_DIR",unset="")
+  if(nzchar(override))return(normalizePath(override,mustWork=TRUE))
+  args<-commandArgs(trailingOnly=FALSE); f<-grep("^--file=",args,value=TRUE)
+  if(length(f)>0)return(dirname(normalizePath(sub("^--file=","",f[1]))))
+  if(requireNamespace("rstudioapi",quietly=TRUE)&&rstudioapi::isAvailable()){
+    p<-rstudioapi::getActiveDocumentContext()$path;if(nzchar(p))return(dirname(normalizePath(p)))
+  }
+  normalizePath(getwd())
+}
+script_dir<-get_script_dir(); project_dir<-normalizePath(file.path(script_dir,".."),mustWork=FALSE)
+read_tsv_safe<-function(path){
+  if(!file.exists(path))stop("Missing input: ",path)
+  for(enc in c("UTF-8","UTF-8-BOM","GB18030","GBK")){
+    lines<-tryCatch(readLines(path,encoding=enc,warn=FALSE),error=function(e)NULL)
+    if(is.null(lines)||length(lines)<2)next
+    x<-tryCatch(read.delim(textConnection(lines),sep="\t",header=TRUE,quote="\"",fill=TRUE,comment.char="",stringsAsFactors=FALSE,check.names=FALSE,na.strings=c("","NA","N/A")),error=function(e)NULL)
+    if(!is.null(x)&&nrow(x)>1)return(x)
+  }
+  stop("Cannot read: ",path)
+}
+article_dat<-read_tsv_safe(file.path(project_dir,"main_article.txt"))|>mutate(
+  article_no=as.numeric(article_no),publication_year=as.numeric(publication_year),model_count=as.numeric(model_count),mapped_model_count=as.numeric(mapped_model_count),mapping_coverage=as.numeric(mapping_coverage),
+  across(c(lag_submission_mean_days,lag_acceptance_mean_days,lag_online_mean_days,review_delay_days,production_delay_days,total_editorial_delay_days),as.numeric),
+  submission_date=as.Date(submission_date),acceptance_date=as.Date(acceptance_date),online_date=as.Date(online_date),
+  any_nonpositive_submission=tolower(as.character(any_nonpositive_submission))%in%c("true","1"),has_lamda=tolower(as.character(has_lamda))%in%c("true","1"))
+model_dat<-read_tsv_safe(file.path(project_dir,"main_model.txt"))|>mutate(
+  article_no=as.numeric(article_no),table2_row=as.numeric(table2_row),publication_year=as.numeric(publication_year),primary_eligible=as.numeric(primary_eligible),
+  model_release_date=as.Date(model_release_date),submission_date=as.Date(submission_date),acceptance_date=as.Date(acceptance_date),online_date=as.Date(online_date),
+  across(c(lag_submission_days,lag_acceptance_days,lag_online_days),as.numeric))
+write_tsv<-function(x,path)write.table(x,path,sep="\t",row.names=FALSE,col.names=TRUE,quote=FALSE,fileEncoding="UTF-8")
+desc_stats<-function(x){x<-x[is.finite(x)];if(!length(x))return(data.frame(n=0,mean=NA,sd=NA,median=NA,q1=NA,q3=NA,min=NA,max=NA));data.frame(n=length(x),mean=mean(x),sd=if(length(x)>1)sd(x)else 0,median=median(x),q1=unname(quantile(x,.25)),q3=unname(quantile(x,.75)),min=min(x),max=max(x))}
+mean_or_na<-function(x)if(all(is.na(x)))NA_real_ else mean(x,na.rm=TRUE)
+fmt_p<-function(p)ifelse(is.na(p),"P unavailable",ifelse(p<.001,"P < 0.001",paste0("P = ",sprintf("%.3f",p))))
+pal<-c("#6F4C9F","#D56C9C","#7B8CCB","#B68ACD","#F59B5E","#F6D55C","#9E9E9E","#338333")
+font_family<-"Arial"
+theme_journal<-function(base_size=12)theme_classic(base_size=base_size,base_family=font_family)+theme(text=element_text(colour="#222222"),plot.title=element_text(face="bold",size=base_size+2),plot.subtitle=element_text(colour="#555555",margin=margin(b=8)),plot.caption=element_text(colour="#555555",size=base_size-2,hjust=0,margin=margin(t=8)),axis.title=element_text(face="bold"),legend.title=element_text(face="bold"),legend.position="top",panel.grid.major.y=element_line(colour="#E6E6E6",linewidth=.3),panel.grid.minor=element_blank(),plot.margin=margin(10,14,10,10))
+save_figure<-function(p,stem,width,height){
+  if(!is.null(p$labels$subtitle)&&is.character(p$labels$subtitle))p<-p+labs(subtitle=paste(strwrap(p$labels$subtitle,width=78),collapse="\n"))
+  if(!is.null(p$labels$caption)&&is.character(p$labels$caption))p<-p+labs(caption=paste(strwrap(p$labels$caption,width=105),collapse="\n"))
+  p<-p+theme(plot.caption.position="plot",plot.caption=element_text(lineheight=.95))
+  saveRDS(p,file.path(script_dir,paste0(stem,".plot.rds")))
+  ggsave(file.path(script_dir,paste0(stem,".pdf")),p,device=grDevices::cairo_pdf,width=width,height=height,units="in",bg="white")
+  ggsave(file.path(script_dir,paste0(stem,".png")),p,device="png",dpi=600,width=width,height=height,units="in",bg="white")
+}
+
+d<-model_dat|>filter(primary_eligible==1,is.finite(publication_year),nzchar(model_family))|>distinct(publication_year,article_no,table2_row,.keep_all=TRUE)
+top<-d|>count(model_family,sort=TRUE)|>slice_head(n=8)|>pull(model_family)
+d<-d|>mutate(family_group=if_else(model_family%in%top,model_family,"Other model families"))
+plot_dat<-d|>count(publication_year,family_group)|>group_by(publication_year)|>mutate(total=sum(n),percent=100*n/total)|>ungroup()
+test_d<-d|>filter(publication_year<=2025);obs_tab<-table(factor(test_d$publication_year),factor(test_d$family_group));obs_chi<-suppressWarnings(unname(chisq.test(obs_tab,correct=FALSE)$statistic))
+article_year<-test_d|>distinct(article_no,publication_year);article_ids<-article_year$article_no;year_values<-article_year$publication_year;B<-10000;set.seed(20261017)
+null_chi<-replicate(B,{perm_year<-sample(year_values,length(year_values),replace=FALSE);names(perm_year)<-article_ids;tab_b<-table(factor(perm_year[as.character(test_d$article_no)],levels=sort(unique(year_values))),factor(test_d$family_group));suppressWarnings(unname(chisq.test(tab_b,correct=FALSE)$statistic))})
+p_value<-(1+sum(null_chi>=obs_chi-1e-12,na.rm=TRUE))/(B+1);stats<-data.frame(analysis_role="Sensitivity analysis restricted to complete years",method="Article-cluster permutation chi-square",years="2022-2025",n_articles=n_distinct(test_d$article_no),n_article_model_occurrences=nrow(test_d),chi_square=obs_chi,permutations=B,p_value=p_value)
+write_tsv(plot_dat,file.path(script_dir,"fig 3g analysis data used.txt"));write_tsv(stats,file.path(script_dir,"fig 3g statistical results.txt"))
+family_order<-plot_dat|>group_by(family_group)|>summarise(total_n=sum(n),.groups="drop")|>arrange(total_n)|>pull(family_group)
+plot_dat<-plot_dat|>mutate(family_group=factor(family_group,levels=family_order))
+p<-ggplot(plot_dat,aes(factor(publication_year),family_group))+
+  geom_point(aes(size=n,fill=percent),shape=21,colour="white",stroke=.65,alpha=.96)+
+  geom_text(aes(label=ifelse(percent>=5,paste0(sprintf("%.0f",percent),"%"),"")),family=font_family,size=2.1,colour="#222222")+
+  scale_size(range=c(3,13),breaks=c(100,200,300),name="Occurrences")+
+  scale_fill_gradientn(colours=c("#F4F1F8",pal[4],pal[2],pal[5],pal[6]),name="Annual share",labels=function(x)paste0(x,"%"))+
+  scale_x_discrete(labels=function(x)ifelse(x=="2026","2026\n(partial)",x))+
+  labs(title="Model-family composition of the evidence base",subtitle="Bubble size shows occurrences; colour and labels show each family's annual share",x="Publication year",y=NULL,caption=paste0("Eight most frequently studied families; remaining models grouped as other. All years are descriptive and 2026 is partial. Complete-year sensitivity analysis (2022-2025): article-cluster permutation test ",fmt_p(stats$p_value),"; n=",stats$n_articles," articles and ",stats$n_article_model_occurrences," occurrences."))+
+  guides(
+    size=guide_legend(
+      order=1,
+      title.position="left",
+      override.aes=list(fill=pal[1],colour="#222222",alpha=1,shape=21,stroke=.55)
+    ),
+    fill=guide_colourbar(order=2,title.position="left",barwidth=grid::unit(3.2,"cm"),barheight=grid::unit(.38,"cm"))
+  )+
+  theme_journal()+theme(
+    panel.grid.major=element_line(colour="#ECECEC",linewidth=.3),
+    legend.position="top",
+    legend.box="vertical",
+    legend.justification="center",
+    legend.key=element_rect(fill="white",colour=NA),
+    legend.key.width=grid::unit(1.25,"cm"),
+    legend.spacing.x=grid::unit(4,"pt")
+  )
+save_figure(p,"Figure 3 G Model-family composition over time",9.2,6.1)
