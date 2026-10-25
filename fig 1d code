@@ -1,0 +1,119 @@
+# ============================================================
+# LLM obsolescence study: reproducible figure script
+# Inputs: main_article.txt and main_model.txt in the package root
+# Outputs: analysis data, statistical results, 600 dpi PNG and vector PDF
+# ============================================================
+required_packages <- c("ggplot2","dplyr","tidyr","forcats","scales","sandwich","lmtest")
+missing_packages <- required_packages[!vapply(required_packages,requireNamespace,logical(1),quietly=TRUE)]
+if(length(missing_packages)>0) install.packages(missing_packages,repos="https://cloud.r-project.org",dependencies=TRUE)
+suppressPackageStartupMessages({library(ggplot2);library(dplyr);library(tidyr);library(forcats);library(scales)})
+get_script_dir <- function(){
+  override<-Sys.getenv("LLM_LAG_SCRIPT_DIR",unset="")
+  if(nzchar(override))return(normalizePath(override,mustWork=TRUE))
+  args<-commandArgs(trailingOnly=FALSE); f<-grep("^--file=",args,value=TRUE)
+  if(length(f)>0)return(dirname(normalizePath(sub("^--file=","",f[1]))))
+  if(requireNamespace("rstudioapi",quietly=TRUE)&&rstudioapi::isAvailable()){
+    p<-rstudioapi::getActiveDocumentContext()$path;if(nzchar(p))return(dirname(normalizePath(p)))
+  }
+  normalizePath(getwd())
+}
+script_dir<-get_script_dir(); project_dir<-normalizePath(file.path(script_dir,".."),mustWork=FALSE)
+read_tsv_safe<-function(path){
+  if(!file.exists(path))stop("Missing input: ",path)
+  for(enc in c("UTF-8","UTF-8-BOM","GB18030","GBK")){
+    lines<-tryCatch(readLines(path,encoding=enc,warn=FALSE),error=function(e)NULL)
+    if(is.null(lines)||length(lines)<2)next
+    x<-tryCatch(read.delim(textConnection(lines),sep="\t",header=TRUE,quote="\"",fill=TRUE,comment.char="",stringsAsFactors=FALSE,check.names=FALSE,na.strings=c("","NA","N/A")),error=function(e)NULL)
+    if(!is.null(x)&&nrow(x)>1)return(x)
+  }
+  stop("Cannot read: ",path)
+}
+article_dat<-read_tsv_safe(file.path(project_dir,"main_article.txt"))|>mutate(
+  article_no=as.numeric(article_no),publication_year=as.numeric(publication_year),model_count=as.numeric(model_count),mapped_model_count=as.numeric(mapped_model_count),mapping_coverage=as.numeric(mapping_coverage),
+  across(c(lag_submission_mean_days,lag_acceptance_mean_days,lag_online_mean_days,review_delay_days,production_delay_days,total_editorial_delay_days),as.numeric),
+  submission_date=as.Date(submission_date),acceptance_date=as.Date(acceptance_date),online_date=as.Date(online_date),
+  any_nonpositive_submission=tolower(as.character(any_nonpositive_submission))%in%c("true","1"),has_lamda=tolower(as.character(has_lamda))%in%c("true","1"))
+model_dat<-read_tsv_safe(file.path(project_dir,"main_model.txt"))|>mutate(
+  article_no=as.numeric(article_no),table2_row=as.numeric(table2_row),publication_year=as.numeric(publication_year),primary_eligible=as.numeric(primary_eligible),
+  model_release_date=as.Date(model_release_date),submission_date=as.Date(submission_date),acceptance_date=as.Date(acceptance_date),online_date=as.Date(online_date),
+  across(c(lag_submission_days,lag_acceptance_days,lag_online_days),as.numeric))
+write_tsv<-function(x,path)write.table(x,path,sep="\t",row.names=FALSE,col.names=TRUE,quote=FALSE,fileEncoding="UTF-8")
+desc_stats<-function(x){x<-x[is.finite(x)];if(!length(x))return(data.frame(n=0,mean=NA,sd=NA,median=NA,q1=NA,q3=NA,min=NA,max=NA));data.frame(n=length(x),mean=mean(x),sd=if(length(x)>1)sd(x)else 0,median=median(x),q1=unname(quantile(x,.25)),q3=unname(quantile(x,.75)),min=min(x),max=max(x))}
+mean_or_na<-function(x)if(all(is.na(x)))NA_real_ else mean(x,na.rm=TRUE)
+fmt_p<-function(p)ifelse(is.na(p),"P unavailable",ifelse(p<.001,"P < 0.001",paste0("P = ",sprintf("%.3f",p))))
+pal<-c("#6F4C9F","#D56C9C","#7B8CCB","#B68ACD","#F59B5E","#F6D55C","#9E9E9E","#338333")
+font_family<-"Arial"
+theme_journal<-function(base_size=12)theme_classic(base_size=base_size,base_family=font_family)+theme(text=element_text(colour="#222222"),plot.title=element_text(face="bold",size=base_size+2),plot.subtitle=element_text(colour="#555555",margin=margin(b=8)),plot.caption=element_text(colour="#555555",size=base_size-2,hjust=0,margin=margin(t=8)),axis.title=element_text(face="bold"),legend.title=element_text(face="bold"),legend.position="top",panel.grid.major.y=element_line(colour="#E6E6E6",linewidth=.3),panel.grid.minor=element_blank(),plot.margin=margin(10,14,10,10))
+save_figure<-function(p,stem,width,height){
+  if(!is.null(p$labels$subtitle)&&is.character(p$labels$subtitle))p<-p+labs(subtitle=paste(strwrap(p$labels$subtitle,width=78),collapse="\n"))
+  if(!is.null(p$labels$caption)&&is.character(p$labels$caption))p<-p+labs(caption=paste(strwrap(p$labels$caption,width=105),collapse="\n"))
+  p<-p+theme(plot.caption.position="plot",plot.caption=element_text(lineheight=.95))
+  saveRDS(p,file.path(script_dir,paste0(stem,".plot.rds")))
+  ggsave(file.path(script_dir,paste0(stem,".pdf")),p,device=grDevices::cairo_pdf,width=width,height=height,units="in",bg="white")
+  ggsave(file.path(script_dir,paste0(stem,".png")),p,device="png",dpi=600,width=width,height=height,units="in",bg="white")
+}
+
+composition<-article_dat|>
+  filter(lag_submission_mean_days>=0,review_delay_days>=0,production_delay_days>=0)|>
+  mutate(total=lag_submission_mean_days+review_delay_days+production_delay_days)|>filter(total>0)|>
+  transmute(article_no,publication_year,
+    release_share=100*lag_submission_mean_days/total,
+    peer_review_share=100*review_delay_days/total,
+    production_share=100*production_delay_days/total)|>
+  mutate(x=(peer_review_share+.5*production_share)/100,
+         y=(sqrt(3)/2)*production_share/100,
+         year_label=ifelse(publication_year==2026,"2026 partial",as.character(publication_year)))
+shares<-composition|>select(article_no,publication_year,release_share,peer_review_share,production_share)|>
+  pivot_longer(c(release_share,peer_review_share,production_share),names_to="component",values_to="percent")|>
+  mutate(component=recode(component,release_share="Release to submission",peer_review_share="Peer review",production_share="Production"))
+annual_wide<-composition|>group_by(publication_year,year_label)|>
+  summarise(n=n(),release_share=mean(release_share),peer_review_share=mean(peer_review_share),production_share=mean(production_share),.groups="drop")|>
+  mutate(x=(peer_review_share+.5*production_share)/100,y=(sqrt(3)/2)*production_share/100,
+    label=paste0(year_label,"\n",sprintf("%.0f/%.0f/%.0f%%",release_share,peer_review_share,production_share)),
+    label_x=case_when(publication_year==2022~.09,publication_year==2023~.73,publication_year==2024~.61,publication_year==2025~.45,TRUE~.30),
+    label_y=case_when(publication_year==2022~.20,publication_year==2023~.31,publication_year==2024~.22,publication_year==2025~.16,TRUE~-.06))
+annual<-annual_wide|>select(publication_year,n,release_share,peer_review_share,production_share)|>
+  pivot_longer(c(release_share,peer_review_share,production_share),names_to="component",values_to="mean_percent")|>
+  mutate(component=recode(component,release_share="Release to submission",peer_review_share="Peer review",production_share="Production"))
+write_tsv(shares,file.path(script_dir,"fig 1d analysis data used.txt"));write_tsv(annual,file.path(script_dir,"fig 1d annual summary.txt"))
+h<-sqrt(3)/2
+triangle<-data.frame(x=c(0,1,.5,0),y=c(0,0,h,0))
+tick_vals<-c(.25,.50,.75)
+production_ticks<-data.frame(
+  x=1-.5*tick_vals+.025,y=h*tick_vals,
+  label=paste0(tick_vals*100,"%"))
+release_ticks<-data.frame(
+  x=.5*(1-tick_vals)-.025,y=h*(1-tick_vals),
+  label=paste0(tick_vals*100,"%"))
+peer_ticks<-data.frame(
+  x=tick_vals,y=-.022,
+  label=paste0(tick_vals*100,"%"))
+grid_lines<-bind_rows(lapply(c(.25,.5,.75),function(v){
+  bind_rows(
+    data.frame(group=paste0("prod",v),x=c(.5*v,1-.5*v),y=c(h*v,h*v)),
+    data.frame(group=paste0("peer",v),x=c(v,.5+.5*v),y=c(0,h*(1-v))),
+    data.frame(group=paste0("release",v),x=c(.5*(1-v),1-v),y=c(h*(1-v),0)))
+}))
+year_cols<-setNames(pal[c(1,3,2,8,6)],c("2022","2023","2024","2025","2026 partial"))
+p<-ggplot()+
+  geom_line(data=grid_lines,aes(x,y,group=group),colour="#E6E6E6",linewidth=.35)+
+  geom_path(data=triangle,aes(x,y),colour="#333333",linewidth=.9)+
+  geom_text(data=production_ticks,aes(x,y,label=label),inherit.aes=FALSE,hjust=0,vjust=.5,
+            family=font_family,size=2.7,colour="#666666")+
+  geom_text(data=release_ticks,aes(x,y,label=label),inherit.aes=FALSE,hjust=1,vjust=.5,
+            family=font_family,size=2.7,colour="#666666")+
+  geom_text(data=peer_ticks,aes(x,y,label=label),inherit.aes=FALSE,hjust=.5,vjust=1,
+            family=font_family,size=2.7,colour="#666666")+
+  geom_point(data=composition,aes(x,y,colour=year_label),size=1.7,alpha=.24)+
+  geom_path(data=annual_wide,aes(x,y,group=1),colour="#555555",linetype="22",linewidth=.75)+
+  geom_point(data=annual_wide,aes(x,y,fill=year_label),shape=21,size=5.2,colour="white",stroke=.9)+
+  geom_segment(data=annual_wide,aes(x=x,y=y,xend=label_x,yend=label_y),colour="#8A8A8A",linewidth=.35)+
+  geom_label(data=annual_wide,aes(x=label_x,y=label_y,label=label,colour=year_label),fill="white",linewidth=.22,family=font_family,fontface="bold",size=2.45,lineheight=.92,show.legend=FALSE)+
+  annotate("text",x=-.055,y=-.052,label="Release to\nsubmission\n100%",hjust=1,vjust=1,family=font_family,fontface="bold",size=3.0,lineheight=.95)+
+  annotate("text",x=1.055,y=-.052,label="Peer review\n100%",hjust=0,vjust=1,family=font_family,fontface="bold",size=3.0,lineheight=.95)+
+  annotate("text",x=.5,y=h+.035,label="Production\n100%",hjust=.5,vjust=0,family=font_family,fontface="bold",size=3.0,lineheight=.95)+
+  scale_colour_manual(values=year_cols,name=NULL,guide="none")+scale_fill_manual(values=year_cols,guide="none")+
+  coord_equal(xlim=c(-.16,1.16),ylim=c(-.12,h+.12),clip="off")+
+  labs(title="Composition of total publication lag",subtitle="Article-level lag composition; large labelled points show annual means",x=NULL,y=NULL,caption=paste0("Edge scales show component percentages. Annual labels give mean release-to-submission/peer-review/production shares. Non-negative components: n = ",nrow(composition),". Values sum to 100% per article; 2026 is partial through 14 Sep."))+
+  theme_void(base_family=font_family)+theme(plot.title=element_text(face="bold",size=12.5,colour="#222222",margin=margin(b=3)),plot.subtitle=element_text(size=9.5,colour="#555555",margin=margin(b=12)),plot.caption=element_text(size=8.2,colour="#555555",hjust=0,lineheight=.95,margin=margin(t=12)),legend.position="none",plot.margin=margin(14,20,20,20))
+save_figure(p,"Figure 1 D Composition of total publication lag",8.2,5.5)
