@@ -1,0 +1,57 @@
+required_packages<-c("ggplot2","dplyr","tidyr","scales")
+missing_packages<-required_packages[!vapply(required_packages,requireNamespace,logical(1),quietly=TRUE)]
+if(length(missing_packages)>0)install.packages(missing_packages,repos="https://cloud.r-project.org",dependencies=TRUE)
+suppressPackageStartupMessages({library(ggplot2);library(dplyr);library(tidyr);library(scales)})
+get_script_dir<-function(){
+ override<-Sys.getenv("LLM_LAG_SCRIPT_DIR",unset="")
+ if(nzchar(override))return(normalizePath(override,mustWork=TRUE))
+ args<-commandArgs(trailingOnly=FALSE);f<-grep("^--file=",args,value=TRUE)
+ if(length(f))return(dirname(normalizePath(sub("^--file=","",f[1]))))
+ if(requireNamespace("rstudioapi",quietly=TRUE)&&rstudioapi::isAvailable()){p<-rstudioapi::getActiveDocumentContext()$path;if(nzchar(p))return(dirname(normalizePath(p)))}
+ normalizePath(getwd())
+}
+script_dir<-get_script_dir();project_dir<-normalizePath(file.path(script_dir,".."),mustWork=TRUE)
+read_tsv<-function(p){
+ if(!file.exists(p))stop("Missing input: ",p)
+ for(enc in c("UTF-8","UTF-8-BOM","GB18030","GBK")){
+  lines<-tryCatch(readLines(p,encoding=enc,warn=FALSE),error=function(e)NULL)
+  if(is.null(lines)||length(lines)<2)next
+  x<-tryCatch(read.delim(textConnection(lines),sep="\t",header=TRUE,quote="",fill=TRUE,comment.char="",stringsAsFactors=FALSE,check.names=FALSE,na.strings=c("","NA","N/A")),error=function(e)NULL)
+  if(!is.null(x)&&nrow(x)>0)return(x)
+ }
+ stop("Cannot read: ",p)
+}
+article<-read_tsv(file.path(project_dir,"figure5_article_data.txt"))
+pre<-article|>filter(preprint_status=="Yes")
+num<-function(x)suppressWarnings(as.numeric(x))
+article<-article|>mutate(publication_year=num(publication_year),lag_online_mean_days=num(lag_online_mean_days))
+pre<-pre|>mutate(publication_year=num(publication_year),across(c(preprint_to_submission_days,preprint_to_acceptance_days,preprint_to_online_days,preprint_strict_gllm_count,final_strict_gllm_count,preprint_final_jaccard,preprint_models_retained,final_models_added,preprint_models_removed,model_turnover_count,review_delay_days,production_delay_days),num))
+pal<-c("#6F4C9F","#D56C9C","#7B8CCB","#B68ACD","#F59B5E","#F6D55C","#9E9E9E","#338333")
+font_family<-"Arial"
+theme_journal<-function(base_size=13)theme_classic(base_size=base_size,base_family=font_family)+theme(
+ text=element_text(colour="#222222"),plot.title=element_text(face="bold",size=base_size+2),
+ plot.subtitle=element_text(colour="#555555",margin=margin(b=9)),plot.caption=element_text(colour="#555555",size=base_size-2,hjust=0,margin=margin(t=9)),
+ axis.title=element_text(face="bold"),legend.title=element_text(face="bold"),legend.position="top",
+ panel.grid.major.y=element_line(colour="#E8E8E8",linewidth=.35),panel.grid.minor=element_blank(),
+ plot.margin=margin(12,18,12,12))
+fmt_p<-function(p)ifelse(is.na(p),"P unavailable",ifelse(p<.001,"P < 0.001",paste0("P = ",formatC(p,format="f",digits=3))))
+write_tsv<-function(x,p)write.table(x,p,sep="\t",row.names=FALSE,col.names=TRUE,quote=FALSE,fileEncoding="UTF-8")
+save_panel<-function(p,stem,w=10.5,h=7.2){
+ saveRDS(p,file.path(script_dir,paste0(stem,".plot.rds")))
+ ggsave(file.path(script_dir,paste0(stem,".pdf")),p,device=grDevices::cairo_pdf,width=w,height=h,units="in",bg="white")
+ ggsave(file.path(script_dir,paste0(stem,".png")),p,device="png",dpi=600,width=w,height=h,units="in",bg="white")
+}
+
+d<-pre|>filter(is.finite(final_models_added),is.finite(preprint_models_removed))|>select(article_no,final_models_added,preprint_models_removed)|>
+ pivot_longer(-article_no,names_to="direction",values_to="count")|>mutate(direction=factor(direction,levels=c("preprint_models_removed","final_models_added"),labels=c("Removed after preprint","Added by publication")))
+s<-d|>group_by(direction)|>summarise(n=n(),median=median(count),mean=mean(count),articles_any=sum(count>0),.groups="drop")
+paired<-wilcox.test(pre$final_models_added,pre$preprint_models_removed,paired=TRUE,exact=FALSE)
+set.seed(20261020)
+p<-ggplot(d,aes(direction,count,group=article_no))+geom_line(colour="#D7D7D7",alpha=.32,linewidth=.35)+
+ geom_jitter(aes(colour=direction),width=.10,height=.04,size=2.5,alpha=.62)+
+ stat_summary(aes(group=direction),fun=median,geom="point",shape=23,size=6,fill=pal[6],colour="#222222",stroke=1)+
+ scale_colour_manual(values=pal[c(2,8)],guide="none")+scale_y_continuous(breaks=pretty_breaks())+
+ labs(title="Numbers of models added and removed",subtitle="Paired article-level counts; diamonds mark medians",x=NULL,y="Number of strict GLLMs",
+ caption=paste0("Paired Wilcoxon test: ",fmt_p(paired$p.value),"; n = ",nrow(pre),". Zero counts are retained."))+theme_journal()
+write_tsv(d,file.path(script_dir,"fig 5f analysis data used.txt"));write_tsv(s,file.path(script_dir,"fig 5f group summary.txt"));writeLines(capture.output(paired),file.path(script_dir,"fig 5f statistical results.txt"))
+save_panel(p,"Figure 5 F Models added and removed")
