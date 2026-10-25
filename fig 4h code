@@ -1,0 +1,81 @@
+# ============================================================
+# LLM obsolescence study: reproducible figure script
+# Inputs: main_article.txt and main_model.txt in the package root
+# Outputs: analysis data, statistical results, 600 dpi PNG and vector PDF
+# ============================================================
+required_packages <- c("ggplot2","dplyr","tidyr","forcats","scales","sandwich","lmtest")
+missing_packages <- required_packages[!vapply(required_packages,requireNamespace,logical(1),quietly=TRUE)]
+if(length(missing_packages)>0) install.packages(missing_packages,repos="https://cloud.r-project.org",dependencies=TRUE)
+suppressPackageStartupMessages({library(ggplot2);library(dplyr);library(tidyr);library(forcats);library(scales)})
+get_script_dir <- function(){
+  override<-Sys.getenv("LLM_LAG_SCRIPT_DIR",unset="")
+  if(nzchar(override))return(normalizePath(override,mustWork=TRUE))
+  args<-commandArgs(trailingOnly=FALSE); f<-grep("^--file=",args,value=TRUE)
+  if(length(f)>0)return(dirname(normalizePath(sub("^--file=","",f[1]))))
+  if(requireNamespace("rstudioapi",quietly=TRUE)&&rstudioapi::isAvailable()){
+    p<-rstudioapi::getActiveDocumentContext()$path;if(nzchar(p))return(dirname(normalizePath(p)))
+  }
+  normalizePath(getwd())
+}
+script_dir<-get_script_dir(); project_dir<-normalizePath(file.path(script_dir,".."),mustWork=FALSE)
+read_tsv_safe<-function(path){
+  if(!file.exists(path))stop("Missing input: ",path)
+  for(enc in c("UTF-8","UTF-8-BOM","GB18030","GBK")){
+    lines<-tryCatch(readLines(path,encoding=enc,warn=FALSE),error=function(e)NULL)
+    if(is.null(lines)||length(lines)<2)next
+    x<-tryCatch(read.delim(textConnection(lines),sep="\t",header=TRUE,quote="\"",fill=TRUE,comment.char="",stringsAsFactors=FALSE,check.names=FALSE,na.strings=c("","NA","N/A")),error=function(e)NULL)
+    if(!is.null(x)&&nrow(x)>1)return(x)
+  }
+  stop("Cannot read: ",path)
+}
+article_dat<-read_tsv_safe(file.path(project_dir,"main_article.txt"))|>mutate(
+  article_no=as.numeric(article_no),publication_year=as.numeric(publication_year),model_count=as.numeric(model_count),mapped_model_count=as.numeric(mapped_model_count),mapping_coverage=as.numeric(mapping_coverage),
+  across(c(lag_submission_mean_days,lag_acceptance_mean_days,lag_online_mean_days,review_delay_days,production_delay_days,total_editorial_delay_days),as.numeric),
+  submission_date=as.Date(submission_date),acceptance_date=as.Date(acceptance_date),online_date=as.Date(online_date),
+  any_nonpositive_submission=tolower(as.character(any_nonpositive_submission))%in%c("true","1"),has_lamda=tolower(as.character(has_lamda))%in%c("true","1"))
+model_dat<-read_tsv_safe(file.path(project_dir,"main_model.txt"))|>mutate(
+  article_no=as.numeric(article_no),table2_row=as.numeric(table2_row),publication_year=as.numeric(publication_year),primary_eligible=as.numeric(primary_eligible),
+  model_release_date=as.Date(model_release_date),submission_date=as.Date(submission_date),acceptance_date=as.Date(acceptance_date),online_date=as.Date(online_date),
+  across(c(lag_submission_days,lag_acceptance_days,lag_online_days),as.numeric))
+write_tsv<-function(x,path)write.table(x,path,sep="\t",row.names=FALSE,col.names=TRUE,quote=FALSE,fileEncoding="UTF-8")
+desc_stats<-function(x){x<-x[is.finite(x)];if(!length(x))return(data.frame(n=0,mean=NA,sd=NA,median=NA,q1=NA,q3=NA,min=NA,max=NA));data.frame(n=length(x),mean=mean(x),sd=if(length(x)>1)sd(x)else 0,median=median(x),q1=unname(quantile(x,.25)),q3=unname(quantile(x,.75)),min=min(x),max=max(x))}
+mean_or_na<-function(x)if(all(is.na(x)))NA_real_ else mean(x,na.rm=TRUE)
+fmt_p<-function(p)ifelse(is.na(p),"P unavailable",ifelse(p<.001,"P < 0.001",paste0("P = ",sprintf("%.3f",p))))
+pal<-c("#6F4C9F","#D56C9C","#7B8CCB","#B68ACD","#F59B5E","#F6D55C","#9E9E9E","#338333")
+font_family<-"Arial"
+theme_journal<-function(base_size=12)theme_classic(base_size=base_size,base_family=font_family)+theme(text=element_text(colour="#222222"),plot.title=element_text(face="bold",size=base_size+2),plot.subtitle=element_text(colour="#555555",margin=margin(b=8)),plot.caption=element_text(colour="#555555",size=base_size-2,hjust=0,margin=margin(t=8)),axis.title=element_text(face="bold"),legend.title=element_text(face="bold"),legend.position="top",panel.grid.major.y=element_line(colour="#E6E6E6",linewidth=.3),panel.grid.minor=element_blank(),plot.margin=margin(10,14,10,10))
+save_figure<-function(p,stem,width,height){
+  if(!is.null(p$labels$subtitle)&&is.character(p$labels$subtitle))p<-p+labs(subtitle=paste(strwrap(p$labels$subtitle,width=78),collapse="\n"))
+  if(!is.null(p$labels$caption)&&is.character(p$labels$caption))p<-p+labs(caption=paste(strwrap(p$labels$caption,width=105),collapse="\n"))
+  p<-p+theme(plot.caption.position="plot",plot.caption=element_text(lineheight=.95))
+  saveRDS(p,file.path(script_dir,paste0(stem,".plot.rds")))
+  ggsave(file.path(script_dir,paste0(stem,".pdf")),p,device=grDevices::cairo_pdf,width=width,height=height,units="in",bg="white")
+  ggsave(file.path(script_dir,paste0(stem,".png")),p,device="png",dpi=600,width=width,height=height,units="in",bg="white")
+}
+
+make_direction_pairs<-function(d,definition){
+  d|>filter(primary_eligible==1,!is.na(class),is.finite(lag_submission_days))|>distinct(article_no,table2_row,.keep_all=TRUE)|>
+    group_by(article_no,class)|>summarise(lag=mean(lag_submission_days),.groups="drop")|>
+    pivot_wider(names_from=class,values_from=lag)|>
+    filter(is.finite(`Open model`),is.finite(`Closed model`))|>
+    transmute(article_no,definition=definition,open_lag=`Open model`,closed_lag=`Closed model`,difference_closed_minus_open=`Closed model`-`Open model`,direction=case_when(difference_closed_minus_open>0~"Closed-model lag longer",difference_closed_minus_open<0~"Open-model lag longer",TRUE~"Equal lag"))
+}
+broad<-model_dat|>mutate(class=case_when(model_access=="Open/open-weight"~"Open model",model_access=="Closed/proprietary"~"Closed model",TRUE~NA_character_))
+strict<-model_dat|>mutate(class=case_when(strict_license_class=="Open-source license confirmed"~"Open model",strict_license_class=="Closed/proprietary"~"Closed model",TRUE~NA_character_))
+pairs<-bind_rows(make_direction_pairs(broad,"Open/open-weight definition"),make_direction_pairs(strict,"Confirmed open-source license"))
+direction_levels<-c("Closed-model lag longer","Equal lag","Open-model lag longer")
+summary_dat<-pairs|>mutate(direction=factor(direction,levels=direction_levels))|>count(definition,direction,.drop=FALSE)|>group_by(definition)|>mutate(total=sum(n),percent=100*n/total)|>ungroup()
+tests<-pairs|>group_by(definition)|>group_modify(~{x<-.x$difference_closed_minus_open;non_ties<-x[x!=0];bt<-binom.test(sum(non_ties>0),length(non_ties),p=.5,alternative="two.sided");data.frame(total_pairs=length(x),non_ties=length(non_ties),closed_longer=sum(x>0),open_longer=sum(x<0),ties=sum(x==0),closed_longer_percent=100*sum(x>0)/length(x),open_longer_percent=100*sum(x<0)/length(x),ties_percent=100*sum(x==0)/length(x),median_difference=median(x),sign_test_p=bt$p.value)})|>ungroup()
+write_tsv(pairs,file.path(script_dir,"fig 3h analysis data used.txt"));write_tsv(summary_dat,file.path(script_dir,"fig 3h direction summary.txt"));write_tsv(tests,file.path(script_dir,"fig 3h statistical results.txt"))
+cap<-paste(paste0(tests$definition,": closed longer ",tests$closed_longer," + open longer ",tests$open_longer," + ties ",tests$ties," = n ",tests$total_pairs," paired articles; exact sign-test ",vapply(tests$sign_test_p,fmt_p,character(1))),collapse="; ")
+p<-ggplot(tests,aes(y=definition))+
+  geom_segment(aes(x=open_longer_percent,xend=closed_longer_percent,yend=definition),linewidth=1.15,colour="#BDBDBD")+
+  geom_point(aes(x=open_longer_percent,size=open_longer),shape=21,fill=pal[8],colour="white",stroke=.8)+
+  geom_point(aes(x=closed_longer_percent,size=closed_longer),shape=21,fill=pal[1],colour="white",stroke=.8)+
+  geom_text(aes(x=open_longer_percent,label=paste0("Open longer: ",open_longer," (",sprintf("%.1f",open_longer_percent),"%)")),nudge_y=-.13,vjust=1,family=font_family,size=2.8,colour=pal[8])+
+  geom_text(aes(x=closed_longer_percent,label=paste0("Closed longer: ",closed_longer," (",sprintf("%.1f",closed_longer_percent),"%)")),nudge_y=.13,vjust=0,family=font_family,size=2.8,colour=pal[1])+
+  scale_size(range=c(4.5,8),guide="none")+
+  scale_x_continuous(labels=function(x)paste0(x,"%"),limits=c(0,100),expand=c(0,0))+
+  labs(title="Direction of within-article model-lag differences",subtitle="Dumbbell plot of the two directional proportions in each paired sample",x="Paired articles",y=NULL,caption=paste0(cap," Same paired article sets are used in Figure 4F."))+
+  theme_journal()+theme(panel.grid.major.y=element_blank(),legend.position="none")
+save_figure(p,"Figure 3 H Direction of within-article open versus closed differences",9.4,5.3)
