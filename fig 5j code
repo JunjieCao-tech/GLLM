@@ -1,0 +1,135 @@
+# ============================================================
+# Leave-one-extreme-article-out influence analysis
+# Each point is the overall median after omitting one article
+# whose article-level lag is below the 1st or above the 99th percentile.
+# ============================================================
+required_packages<-c("ggplot2","dplyr","scales")
+missing_packages<-required_packages[!vapply(required_packages,requireNamespace,logical(1),quietly=TRUE)]
+if(length(missing_packages)>0)install.packages(missing_packages,repos="https://cloud.r-project.org",dependencies=TRUE)
+suppressPackageStartupMessages({library(ggplot2);library(dplyr);library(scales)})
+
+get_script_dir<-function(){
+  override<-Sys.getenv("LLM_LAG_SCRIPT_DIR",unset="")
+  if(nzchar(override))return(normalizePath(override,mustWork=TRUE))
+  args<-commandArgs(trailingOnly=FALSE);f<-grep("^--file=",args,value=TRUE)
+  if(length(f))return(dirname(normalizePath(sub("^--file=","",f[1]))))
+  if(requireNamespace("rstudioapi",quietly=TRUE)&&rstudioapi::isAvailable()){
+    p<-rstudioapi::getActiveDocumentContext()$path;if(nzchar(p))return(dirname(normalizePath(p)))
+  }
+  normalizePath(getwd())
+}
+script_dir<-get_script_dir();project_dir<-normalizePath(file.path(script_dir,".."),mustWork=FALSE)
+read_tsv_safe<-function(path){
+  if(!file.exists(path))stop("Missing input: ",path)
+  for(enc in c("UTF-8","UTF-8-BOM","GB18030","GBK")){
+    lines<-tryCatch(readLines(path,encoding=enc,warn=FALSE),error=function(e)NULL)
+    if(is.null(lines)||length(lines)<2)next
+    x<-tryCatch(read.delim(textConnection(lines),sep="\t",header=TRUE,quote="\"",fill=TRUE,comment.char="",stringsAsFactors=FALSE,check.names=FALSE,na.strings=c("","NA","N/A")),error=function(e)NULL)
+    if(!is.null(x)&&nrow(x)>0)return(x)
+  }
+  stop("Cannot read: ",path)
+}
+write_tsv<-function(x,path)write.table(x,path,sep="\t",row.names=FALSE,col.names=TRUE,quote=FALSE,fileEncoding="UTF-8")
+pal<-c("#6F4C9F","#D56C9C","#7B8CCB","#B68ACD","#F59B5E","#F6D55C","#9E9E9E","#338333")
+font_family<-"Arial"
+theme_journal<-function(base_size=12)theme_classic(base_size=base_size,base_family=font_family)+theme(
+  text=element_text(colour="#222222"),plot.title=element_text(face="bold",size=base_size+2),
+  plot.subtitle=element_text(colour="#555555",margin=margin(b=8)),
+  plot.caption=element_text(colour="#555555",size=base_size-2,hjust=0,margin=margin(t=8)),
+  axis.title=element_text(face="bold"),legend.title=element_text(face="bold"),legend.position="top",
+  panel.grid.major.x=element_line(colour="#E6E6E6",linewidth=.3),panel.grid.minor=element_blank(),
+  plot.margin=margin(10,18,10,10))
+save_figure<-function(p,stem,width,height){
+  if(!is.null(p$labels$subtitle))p<-p+labs(subtitle=paste(strwrap(p$labels$subtitle,width=92),collapse="\n"))
+  if(!is.null(p$labels$caption))p<-p+labs(caption=paste(strwrap(p$labels$caption,width=125),collapse="\n"))
+  saveRDS(p,file.path(script_dir,paste0(stem,".plot.rds")))
+  ggsave(file.path(script_dir,paste0(stem,".pdf")),p,device=grDevices::cairo_pdf,width=width,height=height,units="in",bg="white")
+  ggsave(file.path(script_dir,paste0(stem,".png")),p,device="png",dpi=600,width=width,height=height,units="in",bg="white")
+}
+
+article_dat<-read_tsv_safe(file.path(project_dir,"main_article.txt"))|>mutate(
+  article_no=as.numeric(article_no),
+  lag_submission_mean_days=as.numeric(lag_submission_mean_days),
+  lag_acceptance_mean_days=as.numeric(lag_acceptance_mean_days),
+  lag_online_mean_days=as.numeric(lag_online_mean_days))
+author_meta<-read_tsv_safe(file.path(script_dir,"fig 4j first-author metadata.txt"))|>
+  transmute(article_no=as.numeric(article_no),first_author_family=as.character(first_author_family),
+            publication_year=as.numeric(publication_year),figure_label=as.character(figure_label),
+            metadata_source=as.character(metadata_source))
+
+outcomes<-data.frame(
+  milestone=c("Submission","Acceptance","Online publication"),
+  variable=c("lag_submission_mean_days","lag_acceptance_mean_days","lag_online_mean_days"),
+  stringsAsFactors=FALSE)
+
+influence_rows<-list();summary_rows<-list();k<-1L
+for(i in seq_len(nrow(outcomes))){
+  milestone_i<-outcomes$milestone[i];var_i<-outcomes$variable[i]
+  d<-article_dat|>transmute(article_no,title,doi,lag_days=.data[[var_i]])|>filter(is.finite(lag_days))
+  cuts<-unname(quantile(d$lag_days,c(.01,.99),type=7,na.rm=TRUE))
+  full_median<-median(d$lag_days)
+  extreme<-d|>filter(lag_days<cuts[1]|lag_days>cuts[2])|>mutate(
+    tail=ifelse(lag_days<cuts[1],"Lower 1%","Upper 1%"))|>arrange(lag_days,article_no)
+  if(!nrow(extreme))stop("No extreme articles identified for ",milestone_i)
+  for(j in seq_len(nrow(extreme))){
+    loo<-d$lag_days[d$article_no!=extreme$article_no[j]]
+    influence_rows[[k]]<-data.frame(
+      milestone=milestone_i,variable=var_i,full_n=nrow(d),full_median_days=full_median,
+      lower_1pct_cutoff_days=cuts[1],upper_99pct_cutoff_days=cuts[2],
+      omitted_article_no=extreme$article_no[j],omitted_article_title=extreme$title[j],
+      omitted_article_doi=extreme$doi[j],omitted_lag_days=extreme$lag_days[j],tail=extreme$tail[j],
+      leave_one_out_n=length(loo),leave_one_out_median_days=median(loo),
+      absolute_change_days=abs(median(loo)-full_median),signed_change_days=median(loo)-full_median,
+      stringsAsFactors=FALSE)
+    k<-k+1L
+  }
+  tmp<-do.call(rbind,influence_rows)[do.call(rbind,influence_rows)$milestone==milestone_i,,drop=FALSE]
+  summary_rows[[i]]<-data.frame(
+    milestone=milestone_i,full_n=nrow(d),full_median_days=full_median,
+    lower_1pct_cutoff_days=cuts[1],upper_99pct_cutoff_days=cuts[2],
+    extreme_articles_n=nrow(extreme),lower_extremes_n=sum(extreme$tail=="Lower 1%"),upper_extremes_n=sum(extreme$tail=="Upper 1%"),
+    leave_one_out_median_min_days=min(tmp$leave_one_out_median_days),
+    leave_one_out_median_max_days=max(tmp$leave_one_out_median_days),
+    maximum_absolute_change_days=max(tmp$absolute_change_days),
+    most_influential_article_no=tmp$omitted_article_no[which.max(tmp$absolute_change_days)],
+    stringsAsFactors=FALSE)
+}
+influence<-bind_rows(influence_rows)|>left_join(author_meta,by=c("omitted_article_no"="article_no"))
+missing_author_ids<-unique(influence$omitted_article_no[is.na(influence$figure_label)|!nzchar(influence$figure_label)])
+if(length(missing_author_ids))stop("Missing first-author metadata for extreme article(s): ",paste(missing_author_ids,collapse=", "))
+summary_dat<-bind_rows(summary_rows)
+write_tsv(influence,file.path(script_dir,"fig 4j analysis data used.txt"))
+write_tsv(summary_dat,file.path(script_dir,"fig 4j statistical results.txt"))
+
+plot_dat<-influence|>mutate(
+  milestone=factor(milestone,levels=outcomes$milestone),
+  article_label=paste0(figure_label,", ",sprintf("%.1f",omitted_lag_days)," d"),
+  article_panel=paste(milestone,article_label,sep=" | "))|>
+  arrange(milestone,omitted_lag_days,omitted_article_no)|>
+  mutate(article_panel=factor(article_panel,levels=rev(unique(article_panel))))
+label_map<-setNames(sub("^.* \\| ","",unique(plot_dat$article_panel)),unique(plot_dat$article_panel))
+summary_labels<-summary_dat|>mutate(
+  milestone=factor(milestone,levels=outcomes$milestone),
+  facet_title=paste0(as.character(milestone)," | Full-data median ",sprintf("%.1f",full_median_days)," days; n=",full_n,
+               "\nLeave-one-out range ",sprintf("%.1f",leave_one_out_median_min_days)," to ",sprintf("%.1f",leave_one_out_median_max_days)," days",
+               "; maximum absolute change ",sprintf("%.1f",maximum_absolute_change_days)," days"),
+  facet_title=factor(facet_title,levels=facet_title))
+plot_dat<-plot_dat|>left_join(summary_labels|>select(milestone,facet_title),by="milestone")|>
+  mutate(facet_title=factor(facet_title,levels=summary_labels$facet_title))
+
+p<-ggplot(plot_dat,aes(leave_one_out_median_days,article_panel,colour=tail))+
+  geom_vline(data=summary_labels,aes(xintercept=full_median_days),inherit.aes=FALSE,linetype="dashed",colour="#555555",linewidth=.65)+
+  geom_segment(aes(x=full_median_days,xend=leave_one_out_median_days,y=article_panel,yend=article_panel),colour="#BDBDBD",linewidth=.55)+
+  geom_point(size=3.4,alpha=.95)+
+  facet_wrap(~facet_title,ncol=1,scales="free")+
+  scale_y_discrete(labels=label_map)+
+  scale_colour_manual(values=c("Lower 1%"=pal[3],"Upper 1%"=pal[5]))+
+  scale_x_continuous(labels=label_number(accuracy=.1),expand=expansion(mult=c(.10,.28)))+
+  labs(
+    title="Influence of individual extreme articles on milestone lag",
+    subtitle="Each point is the overall median after omitting one article outside the 1st to 99th percentile range",
+    x="Median model-use lag after omitting the indicated article (days)",y=NULL,colour="Omitted extreme",
+    caption="Dashed lines show the full-data median for each milestone. Article-level mean model-use lags are the analysis observations. Extremes are identified separately for each milestone; only one extreme article is omitted at a time.")+
+  theme_journal()+theme(panel.grid.major.y=element_blank(),strip.text=element_text(face="bold",size=11),
+                        axis.text.y=element_text(size=8),legend.position="top")
+save_figure(p,"Figure 4 J Leave-one-extreme-article-out influence analysis",11.5,13.5)
