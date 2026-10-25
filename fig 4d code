@@ -1,0 +1,63 @@
+# ============================================================
+# LLM obsolescence study: reproducible figure script
+# Inputs: main_article.txt and main_model.txt in the package root
+# Outputs: analysis data, statistical results, 600 dpi PNG and vector PDF
+# ============================================================
+required_packages <- c("ggplot2","dplyr","tidyr","forcats","scales","sandwich","lmtest")
+missing_packages <- required_packages[!vapply(required_packages,requireNamespace,logical(1),quietly=TRUE)]
+if(length(missing_packages)>0) install.packages(missing_packages,repos="https://cloud.r-project.org",dependencies=TRUE)
+suppressPackageStartupMessages({library(ggplot2);library(dplyr);library(tidyr);library(forcats);library(scales)})
+get_script_dir <- function(){
+  override<-Sys.getenv("LLM_LAG_SCRIPT_DIR",unset="")
+  if(nzchar(override))return(normalizePath(override,mustWork=TRUE))
+  args<-commandArgs(trailingOnly=FALSE); f<-grep("^--file=",args,value=TRUE)
+  if(length(f)>0)return(dirname(normalizePath(sub("^--file=","",f[1]))))
+  if(requireNamespace("rstudioapi",quietly=TRUE)&&rstudioapi::isAvailable()){
+    p<-rstudioapi::getActiveDocumentContext()$path;if(nzchar(p))return(dirname(normalizePath(p)))
+  }
+  normalizePath(getwd())
+}
+script_dir<-get_script_dir(); project_dir<-normalizePath(file.path(script_dir,".."),mustWork=FALSE)
+read_tsv_safe<-function(path){
+  if(!file.exists(path))stop("Missing input: ",path)
+  for(enc in c("UTF-8","UTF-8-BOM","GB18030","GBK")){
+    lines<-tryCatch(readLines(path,encoding=enc,warn=FALSE),error=function(e)NULL)
+    if(is.null(lines)||length(lines)<2)next
+    x<-tryCatch(read.delim(textConnection(lines),sep="\t",header=TRUE,quote="\"",fill=TRUE,comment.char="",stringsAsFactors=FALSE,check.names=FALSE,na.strings=c("","NA","N/A")),error=function(e)NULL)
+    if(!is.null(x)&&nrow(x)>1)return(x)
+  }
+  stop("Cannot read: ",path)
+}
+article_dat<-read_tsv_safe(file.path(project_dir,"main_article.txt"))|>mutate(
+  article_no=as.numeric(article_no),publication_year=as.numeric(publication_year),model_count=as.numeric(model_count),mapped_model_count=as.numeric(mapped_model_count),mapping_coverage=as.numeric(mapping_coverage),
+  across(c(lag_submission_mean_days,lag_acceptance_mean_days,lag_online_mean_days,review_delay_days,production_delay_days,total_editorial_delay_days),as.numeric),
+  submission_date=as.Date(submission_date),acceptance_date=as.Date(acceptance_date),online_date=as.Date(online_date),
+  any_nonpositive_submission=tolower(as.character(any_nonpositive_submission))%in%c("true","1"),has_lamda=tolower(as.character(has_lamda))%in%c("true","1"))
+model_dat<-read_tsv_safe(file.path(project_dir,"main_model.txt"))|>mutate(
+  article_no=as.numeric(article_no),table2_row=as.numeric(table2_row),publication_year=as.numeric(publication_year),primary_eligible=as.numeric(primary_eligible),
+  model_release_date=as.Date(model_release_date),submission_date=as.Date(submission_date),acceptance_date=as.Date(acceptance_date),online_date=as.Date(online_date),
+  across(c(lag_submission_days,lag_acceptance_days,lag_online_days),as.numeric))
+write_tsv<-function(x,path)write.table(x,path,sep="\t",row.names=FALSE,col.names=TRUE,quote=FALSE,fileEncoding="UTF-8")
+desc_stats<-function(x){x<-x[is.finite(x)];if(!length(x))return(data.frame(n=0,mean=NA,sd=NA,median=NA,q1=NA,q3=NA,min=NA,max=NA));data.frame(n=length(x),mean=mean(x),sd=if(length(x)>1)sd(x)else 0,median=median(x),q1=unname(quantile(x,.25)),q3=unname(quantile(x,.75)),min=min(x),max=max(x))}
+mean_or_na<-function(x)if(all(is.na(x)))NA_real_ else mean(x,na.rm=TRUE)
+fmt_p<-function(p)ifelse(is.na(p),"P unavailable",ifelse(p<.001,"P < 0.001",paste0("P = ",sprintf("%.3f",p))))
+pal<-c("#6F4C9F","#D56C9C","#7B8CCB","#B68ACD","#F59B5E","#F6D55C","#9E9E9E","#338333")
+font_family<-"Arial"
+theme_journal<-function(base_size=12)theme_classic(base_size=base_size,base_family=font_family)+theme(text=element_text(colour="#222222"),plot.title=element_text(face="bold",size=base_size+2),plot.subtitle=element_text(colour="#555555",margin=margin(b=8)),plot.caption=element_text(colour="#555555",size=base_size-2,hjust=0,margin=margin(t=8)),axis.title=element_text(face="bold"),legend.title=element_text(face="bold"),legend.position="top",panel.grid.major.y=element_line(colour="#E6E6E6",linewidth=.3),panel.grid.minor=element_blank(),plot.margin=margin(10,14,10,10))
+save_figure<-function(p,stem,width,height){
+  if(!is.null(p$labels$subtitle)&&is.character(p$labels$subtitle))p<-p+labs(subtitle=paste(strwrap(p$labels$subtitle,width=78),collapse="\n"))
+  if(!is.null(p$labels$caption)&&is.character(p$labels$caption))p<-p+labs(caption=paste(strwrap(p$labels$caption,width=105),collapse="\n"))
+  p<-p+theme(plot.caption.position="plot",plot.caption=element_text(lineheight=.95))
+  saveRDS(p,file.path(script_dir,paste0(stem,".plot.rds")))
+  ggsave(file.path(script_dir,paste0(stem,".pdf")),p,device=grDevices::cairo_pdf,width=width,height=height,units="in",bg="white")
+  ggsave(file.path(script_dir,paste0(stem,".png")),p,device="png",dpi=600,width=width,height=height,units="in",bg="white")
+}
+
+access_article<-model_dat |> filter(primary_eligible==1,model_access %in% c("Open/open-weight","Closed/proprietary")) |> distinct(article_no,table2_row,.keep_all=TRUE) |> group_by(article_no,model_access) |> summarise(submission=mean_or_na(lag_submission_days),acceptance=mean_or_na(lag_acceptance_days),online=mean_or_na(lag_online_days),.groups="drop")
+wide<-access_article |> pivot_wider(names_from=model_access,values_from=c(submission,acceptance,online),names_sep="__")
+stages<-c(Submission="submission",Acceptance="acceptance","Online publication"="online"); rows<-list(); tests<-list(); set.seed(20261016)
+for(i in seq_along(stages)){nm<-names(stages)[i];v<-stages[[i]];o<-wide[[paste0(v,"__Open/open-weight")]];c<-wide[[paste0(v,"__Closed/proprietary")]];ok<-is.finite(o)&is.finite(c);diff<-c[ok]-o[ok];rows[[i]]<-data.frame(article_no=wide$article_no[ok],stage=nm,open_lag=o[ok],closed_lag=c[ok],difference_closed_minus_open=diff);wt<-wilcox.test(c[ok],o[ok],paired=TRUE,exact=FALSE);boot<-replicate(10000,median(sample(diff,replace=TRUE)));tests[[i]]<-data.frame(stage=nm,n=length(diff),median_difference=median(diff),ci_low=quantile(boot,.025),ci_high=quantile(boot,.975),V=unname(wt$statistic),p_value=wt$p.value)}
+plot_dat<-bind_rows(rows); test_dat<-bind_rows(tests)|>mutate(p_adj_BH=p.adjust(p_value,"BH")); write_tsv(plot_dat,file.path(script_dir,"fig 3d analysis data used.txt"));write_tsv(test_dat,file.path(script_dir,"fig 3d statistical results.txt"))
+p<-ggplot(test_dat,aes(median_difference,stage))+geom_vline(xintercept=0,linetype=2,colour=pal[7])+geom_errorbar(aes(xmin=ci_low,xmax=ci_high),orientation="y",width=.14,linewidth=1,colour=pal[1])+geom_point(shape=21,size=4,fill=pal[2],colour=pal[1])+labs(title="Within-article difference between closed and open models",subtitle="Mixed-access articles; median paired difference with bootstrap 95% CI",x="Closed minus open/open-weight lag (days)",y=NULL)+theme_journal()
+label_x<-max(test_dat$ci_high,na.rm=TRUE)+.06*diff(range(c(test_dat$ci_low,test_dat$ci_high),na.rm=TRUE));p<-p+geom_text(data=transform(test_dat,label_x=label_x),show.legend=FALSE,aes(x=label_x,label=paste0(round(median_difference)," d; n=",n," paired articles")),hjust=0,family=font_family,size=3)+scale_x_continuous(expand=expansion(mult=c(.20,.34)))+labs(caption=paste0("One observation per unique article-model pair; BH-adjusted P values: ",paste(format.pval(test_dat$p_adj_BH,digits=2),collapse=", ")))
+save_figure(p,"Figure 3 D Within-article open versus closed difference",8,4.8)
